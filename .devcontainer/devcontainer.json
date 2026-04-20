@@ -1,0 +1,46 @@
+{
+    "name": "SysY Compiler",
+    "image": "maxxing/compiler-dev",
+    "customizations": {
+        "vscode": {
+            "settings": {
+                "editor.formatOnSave": true,
+                "rust-analyzer.check.allTargets": false
+            },
+            "extensions": [
+                "webfreak.debug",
+                "rust-lang.rust-analyzer",
+                "tamasfe.even-better-toml",
+                "aaron-bond.better-comments",
+                "stackbreak.comment-divider",
+                "zixuanwang.linkerscript",
+                "eamodio.gitlens",
+                "openai.chatgpt",
+                "anthropic.claude-code"
+            ]
+        }
+    },
+    "mounts": [
+        // `${localEnv:HOME}${localEnv:USERPROFILE}` resolves to the host home on macOS/Linux or Windows.
+        "source=${localEnv:HOME}${localEnv:USERPROFILE}/.codex,target=/root/.codex,type=bind,consistency=cached",
+        "source=${localEnv:HOME}${localEnv:USERPROFILE}/.ssh,target=/root/.ssh,type=bind,consistency=cached,readonly",
+        "source=${localEnv:HOME}${localEnv:USERPROFILE}/.claude,target=/root/.claude,type=bind,consistency=cached"
+    ],
+    "containerEnv": {
+        "HTTP_PROXY": "http://host.docker.internal:7890",
+        "HTTPS_PROXY": "http://host.docker.internal:7890",
+        "http_proxy": "http://host.docker.internal:7890",
+        "https_proxy": "http://host.docker.internal:7890",
+        "NO_PROXY": "localhost,127.0.0.1"
+    },
+    "remoteEnv": {
+        "HTTP_PROXY": "http://host.docker.internal:7890",
+        "HTTPS_PROXY": "http://host.docker.internal:7890",
+        "http_proxy": "http://host.docker.internal:7890",
+        "https_proxy": "http://host.docker.internal:7890",
+        "NO_PROXY": "localhost,127.0.0.1"
+    },
+    "workspaceMount": "source=${localWorkspaceFolder},target=/root/compiler,type=bind,consistency=cached",
+    "workspaceFolder": "/root/compiler",
+    "postCreateCommand": "bash .devcontainer/post-create.sh"
+}
