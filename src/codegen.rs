@@ -53,6 +53,7 @@ struct KoopaGen {
     lib_funcs_emitted: HashSet<String>,
     global_decls: String,
     func_ret_types: HashMap<String, Type>,
+    pending_sc_allocas: Vec<String>,
 }
 
 impl KoopaGen {
@@ -71,6 +72,7 @@ impl KoopaGen {
             lib_funcs_emitted: HashSet::new(),
             global_decls: String::new(),
             func_ret_types: HashMap::new(),
+            pending_sc_allocas: Vec::new(),
         }
     }
 
@@ -115,6 +117,7 @@ impl KoopaGen {
     fn alloc_sc(&mut self) -> String {
         let t = format!("@sc_{}", self.sc_count);
         self.sc_count += 1;
+        self.pending_sc_allocas.push(format!("{t} = alloca i32"));
         t
     }
 
@@ -242,7 +245,8 @@ impl KoopaGen {
                     // Add function params to scope
                     for param in &func.params {
                         let koopa_name = self.mangle(&param.name);
-                        self.emit(&format!("@{} = alloca i32", koopa_name));
+                        self.pending_sc_allocas
+                            .push(format!("@{koopa_name} = alloca i32"));
                         self.emit(&format!(
                             "store @{}, @{}",
                             param.name, koopa_name
@@ -254,6 +258,14 @@ impl KoopaGen {
                     }
 
                     self.gen_block(&func.body)?;
+
+                    // Emit pending allocas in entry block
+                    let mut entry_allocas = String::new();
+                    for inst in &self.pending_sc_allocas {
+                        entry_allocas.push_str(&format!("  {inst}\n"));
+                    }
+                    self.body = entry_allocas + &self.body;
+                    self.pending_sc_allocas.clear();
 
                     let params_str: Vec<String> = func
                         .params
@@ -397,7 +409,8 @@ impl KoopaGen {
                     }
                     let koopa_name = self.mangle(&def.name);
                     if def.dims.is_empty() {
-                        self.emit(&format!("@{} = alloca i32", koopa_name));
+                        self.pending_sc_allocas
+                            .push(format!("@{koopa_name} = alloca i32"));
                         if let Some(init) = &def.init {
                             let val = self.gen_expr(init)?;
                             self.emit(&format!("store {val}, @{koopa_name}"));
@@ -414,9 +427,9 @@ impl KoopaGen {
                             .map(|d| format!("i32, {}", self.eval_const(d).unwrap_or(1)))
                             .collect();
                         let array_type = format!("[{}]", dims_str.join(", "));
-                        self.emit(&format!(
-                            "@{} = alloc {}",
-                            koopa_name, array_type
+                        self.pending_sc_allocas.push(format!(
+                            "@{koopa_name} = alloc {}",
+                            array_type
                         ));
                         self.scopes
                             .last_mut()
@@ -601,6 +614,17 @@ impl KoopaGen {
         }
     }
 
+    fn as_br_cond(&mut self, expr: &Expr) -> CompilerResult<String> {
+        let val = self.gen_expr(expr)?;
+        if val.starts_with('%') || val.starts_with('@') {
+            Ok(val)
+        } else {
+            let t = self.alloc_tmp();
+            self.emit(&format!("{t} = ne {val}, 0"));
+            Ok(t)
+        }
+    }
+
     fn gen_expr(&mut self, expr: &Expr) -> CompilerResult<String> {
         match expr {
             Expr::Int(n) => Ok(n.to_string()),
@@ -643,8 +667,7 @@ impl KoopaGen {
             Expr::Binary { op, lhs, rhs } => match op {
                 BinaryOp::And => {
                     let sc = self.alloc_sc();
-                    self.emit(&format!("{sc} = alloca i32"));
-                    let lv = self.gen_expr(lhs)?;
+                    let lv = self.as_br_cond(lhs)?;
                     let rhs_label = self.new_label();
                     let false_label = self.new_label();
                     let end_label = self.new_label();
@@ -665,8 +688,7 @@ impl KoopaGen {
                 }
                 BinaryOp::Or => {
                     let sc = self.alloc_sc();
-                    self.emit(&format!("{sc} = alloca i32"));
-                    let lv = self.gen_expr(lhs)?;
+                    let lv = self.as_br_cond(lhs)?;
                     let true_label = self.new_label();
                     let rhs_label = self.new_label();
                     let end_label = self.new_label();
