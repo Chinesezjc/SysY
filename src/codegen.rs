@@ -4,15 +4,15 @@ use crate::OutputMode;
 use crate::ast::{BinaryOp, Block, BlockItem, CompUnit, Decl, Expr, GlobalItem, Stmt, Type, UnaryOp};
 use crate::error::{CompilerError, CompilerResult};
 
-const LIB_FUNCS: &[(&str, &[Type])] = &[
-    ("getint", &[]),
-    ("getch", &[]),
-    ("getarray", &[Type::Int]),
-    ("putint", &[Type::Int]),
-    ("putch", &[Type::Int]),
-    ("putarray", &[Type::Int, Type::Int]),
-    ("starttime", &[]),
-    ("stoptime", &[]),
+const LIB_FUNCS: &[(&str, Type, &[Type])] = &[
+    ("getint", Type::Int, &[]),
+    ("getch", Type::Int, &[]),
+    ("getarray", Type::Int, &[Type::Int]),
+    ("putint", Type::Void, &[Type::Int]),
+    ("putch", Type::Void, &[Type::Int]),
+    ("putarray", Type::Void, &[Type::Int, Type::Int]),
+    ("starttime", Type::Void, &[]),
+    ("stoptime", Type::Void, &[]),
 ];
 
 pub fn generate(program: &CompUnit, mode: OutputMode) -> CompilerResult<String> {
@@ -23,7 +23,11 @@ pub fn generate(program: &CompUnit, mode: OutputMode) -> CompilerResult<String> 
 }
 
 fn is_lib_func(name: &str) -> bool {
-    LIB_FUNCS.iter().any(|(n, _)| *n == name)
+    LIB_FUNCS.iter().any(|(n, _, _)| *n == name)
+}
+
+fn lib_func_ret_type(name: &str) -> Option<Type> {
+    LIB_FUNCS.iter().find(|(n, _, _)| *n == name).map(|(_, t, _)| *t)
 }
 
 // ── Koopa IR ────────────────────────────────────────────────────────────────
@@ -37,6 +41,7 @@ enum Symbol {
 
 struct KoopaGen {
     scopes: Vec<HashMap<String, Symbol>>,
+    globals: HashMap<String, Symbol>,
     name_count: HashMap<String, usize>,
     tmp: usize,
     label: usize,
@@ -46,12 +51,15 @@ struct KoopaGen {
     body: String,
     decls: String,
     lib_funcs_emitted: HashSet<String>,
+    global_decls: String,
+    func_ret_types: HashMap<String, Type>,
 }
 
 impl KoopaGen {
     fn new() -> Self {
         Self {
             scopes: vec![HashMap::new()],
+            globals: HashMap::new(),
             name_count: HashMap::new(),
             tmp: 0,
             label: 0,
@@ -61,6 +69,8 @@ impl KoopaGen {
             body: String::new(),
             decls: String::new(),
             lib_funcs_emitted: HashSet::new(),
+            global_decls: String::new(),
+            func_ret_types: HashMap::new(),
         }
     }
 
@@ -78,7 +88,7 @@ impl KoopaGen {
                 return Some(sym);
             }
         }
-        None
+        self.globals.get(name)
     }
 
     fn current_scope_contains(&self, name: &str) -> bool {
@@ -135,7 +145,7 @@ impl KoopaGen {
             return;
         }
         self.lib_funcs_emitted.insert(name.to_string());
-        if let Some((_, param_types)) = LIB_FUNCS.iter().find(|(n, _)| *n == name) {
+        if let Some((_, _, param_types)) = LIB_FUNCS.iter().find(|(n, _, _)| *n == name) {
             let params: Vec<String> = param_types
                 .iter()
                 .enumerate()
@@ -166,14 +176,54 @@ impl KoopaGen {
     fn gen_program(mut self, program: &CompUnit) -> CompilerResult<String> {
         let mut out = String::new();
 
-        // Collect all user-defined functions
-        let mut user_funcs: HashSet<String> = HashSet::new();
+        // First pass: collect global declarations and function types
         for item in &program.items {
-            if let GlobalItem::FuncDef(func) = item {
-                user_funcs.insert(func.name.clone());
+            match item {
+                GlobalItem::FuncDef(f) => {
+                    self.func_ret_types.insert(f.name.clone(), f.ret_type);
+                }
+                GlobalItem::FuncDecl(f) => {
+                    self.func_ret_types.insert(f.name.clone(), f.ret_type);
+                }
+                GlobalItem::Decl(decl) => {
+                    match decl {
+                        Decl::Const(defs) => {
+                            for def in defs {
+                                let val = self.eval_const(&def.init)?;
+                                self.globals.insert(def.name.clone(), Symbol::Const(val));
+                            }
+                        }
+                        Decl::Var(defs) => {
+                            for def in defs {
+                                if def.dims.is_empty() {
+                                    let init_val = def.init.as_ref()
+                                        .map(|e| self.eval_const(e))
+                                        .transpose()?
+                                        .unwrap_or(0);
+                                    self.global_decls.push_str(&format!(
+                                        "global @{} = alloc i32, {}\n",
+                                        def.name, init_val
+                                    ));
+                                    self.globals.insert(def.name.clone(), Symbol::Var(def.name.clone()));
+                                } else {
+                                    let dims_str: Vec<String> = def.dims.iter()
+                                        .rev()
+                                        .map(|d| format!("i32, {}", self.eval_const(d).unwrap_or(1)))
+                                        .collect();
+                                    let array_type = format!("[{}]", dims_str.join(", "));
+                                    self.global_decls.push_str(&format!(
+                                        "global @{} = alloc {}\n", def.name, array_type
+                                    ));
+                                    self.globals.insert(def.name.clone(), Symbol::Array(def.name.clone()));
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
 
+        // Second pass: generate functions
         for item in &program.items {
             match item {
                 GlobalItem::FuncDef(func) => {
@@ -193,8 +243,6 @@ impl KoopaGen {
                     for param in &func.params {
                         let koopa_name = self.mangle(&param.name);
                         self.emit(&format!("@{} = alloca i32", koopa_name));
-                        // Store the argument into the allocation
-                        // The param comes in as @param_name in Koopa
                         self.emit(&format!(
                             "store @{}, @{}",
                             param.name, koopa_name
@@ -227,24 +275,19 @@ impl KoopaGen {
                     };
 
                     let func_str = format!(
-                        "{}{}\n{}}}\n",
-                        self.decls, header, self.body
+                        "{}{}{}\n{}}}\n",
+                        self.global_decls, self.decls, header, self.body
                     );
                     out.push_str(&func_str);
+                    self.global_decls.clear();
                     self.decls.clear();
                 }
-                GlobalItem::Decl(decl) => {
-                    if let Decl::Var(_) = decl {
-                        // Global vars not yet supported
-                    }
-                    if let Decl::Const(_) = decl {
-                        // Global consts not yet supported
-                    }
-                }
-                GlobalItem::FuncDecl(_) => {
-                    // Library function declaration — handled by emit_lib_decl when called
-                }
+                GlobalItem::Decl(_) | GlobalItem::FuncDecl(_) => {}
             }
+        }
+        // Any remaining global decls
+        if !self.global_decls.is_empty() {
+            out.push_str(&self.global_decls);
         }
         Ok(out)
     }
@@ -684,13 +727,24 @@ impl KoopaGen {
                     .map(|a| self.gen_expr(a))
                     .collect::<CompilerResult<_>>()?;
                 let args_str = evaled_args.join(", ");
-                let tmp = self.alloc_tmp();
-                if args_str.is_empty() {
-                    self.emit(&format!("{tmp} = call @{name}()"));
+                let is_void = lib_func_ret_type(name) == Some(Type::Void)
+                    || self.func_ret_types.get(name) == Some(&Type::Void);
+                if is_void {
+                    if args_str.is_empty() {
+                        self.emit(&format!("call @{name}()"));
+                    } else {
+                        self.emit(&format!("call @{name}({args_str})"));
+                    }
+                    Ok(String::new())
                 } else {
-                    self.emit(&format!("{tmp} = call @{name}({args_str})"));
+                    let tmp = self.alloc_tmp();
+                    if args_str.is_empty() {
+                        self.emit(&format!("{tmp} = call @{name}()"));
+                    } else {
+                        self.emit(&format!("{tmp} = call @{name}({args_str})"));
+                    }
+                    Ok(tmp)
                 }
-                Ok(tmp)
             }
         }
     }

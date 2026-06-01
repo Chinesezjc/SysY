@@ -33,15 +33,34 @@ impl Parser {
             TokenKind::KwInt | TokenKind::KwVoid => {
                 let ret_type = self.parse_type()?;
                 let name = self.expect_ident()?;
-                self.expect_l_paren()?;
-                let params = self.parse_func_f_params()?;
-                self.expect_r_paren()?;
-                if matches!(self.current_kind(), TokenKind::Semicolon) {
+                if matches!(self.current_kind(), TokenKind::LParen) {
+                    // Function definition or declaration
                     self.advance();
-                    Ok(GlobalItem::FuncDecl(FuncDecl { ret_type, name, params }))
+                    let params = self.parse_func_f_params()?;
+                    self.expect_r_paren()?;
+                    if matches!(self.current_kind(), TokenKind::Semicolon) {
+                        self.advance();
+                        Ok(GlobalItem::FuncDecl(FuncDecl { ret_type, name, params }))
+                    } else {
+                        let body = self.parse_block()?;
+                        Ok(GlobalItem::FuncDef(FuncDef { ret_type, name, params, body }))
+                    }
                 } else {
-                    let body = self.parse_block()?;
-                    Ok(GlobalItem::FuncDef(FuncDef { ret_type, name, params, body }))
+                    // Global variable declaration
+                    let dims = self.parse_array_dims()?;
+                    let init = if matches!(self.current_kind(), TokenKind::Eq) {
+                        self.advance();
+                        Some(self.parse_expr()?)
+                    } else {
+                        None
+                    };
+                    let mut defs = vec![VarDef { name, dims, init }];
+                    while matches!(self.current_kind(), TokenKind::Comma) {
+                        self.advance();
+                        defs.push(self.parse_var_def()?);
+                    }
+                    self.expect_semicolon()?;
+                    Ok(GlobalItem::Decl(Decl::Var(defs)))
                 }
             }
             _ => Err(CompilerError::at(
@@ -365,8 +384,38 @@ impl Parser {
     }
 
     fn parse_unary_expr_or_from(&mut self, lhs: Expr) -> CompilerResult<Expr> {
-        // When we have an LHS (from LVal), we can't apply unary ops — just return as-is
-        Ok(lhs)
+        // Handle postfix operations: function call and array indexing
+        let mut expr = lhs;
+        loop {
+            match self.current_kind() {
+                TokenKind::LParen => {
+                    self.advance();
+                    let args = self.parse_func_r_params()?;
+                    self.expect_r_paren()?;
+                    expr = Expr::Call {
+                        name: match &expr {
+                            Expr::LVal(name) => name.clone(),
+                            _ => return Err(CompilerError::at(
+                                self.current().position,
+                                "expected function name before '('",
+                            )),
+                        },
+                        args,
+                    };
+                }
+                TokenKind::LBracket => {
+                    self.advance();
+                    let index = self.parse_expr()?;
+                    self.expect_r_bracket()?;
+                    expr = Expr::Index {
+                        array: Box::new(expr),
+                        index: Box::new(index),
+                    };
+                }
+                _ => break,
+            }
+        }
+        Ok(expr)
     }
 
     fn parse_lor_expr(&mut self) -> CompilerResult<Expr> {
