@@ -38,7 +38,7 @@ mod tests {
         let output = compile_source(source, OutputMode::Riscv).unwrap();
         assert_eq!(
             output,
-            "  .text\n  .globl main\nmain:\n  li a0, 16\n  addi sp, sp, -4\n  sw a0, 0(sp)\n  li a0, 7\n  lw t0, 0(sp)\n  addi sp, sp, 4\n  add a0, t0, a0\n  ret\n"
+            "  .text\n  .globl main\nmain:\n  addi sp, sp, -16\n  sw ra, 12(sp)\n  li a0, 16\n  addi sp, sp, -4\n  sw a0, 0(sp)\n  li a0, 7\n  lw t0, 0(sp)\n  addi sp, sp, 4\n  add a0, t0, a0\n  lw ra, 12(sp)\n  addi sp, sp, 16\n  ret\n"
         );
     }
 }

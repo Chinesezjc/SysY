@@ -1,0 +1,8 @@
+int getint();
+
+int main() {
+  int a[10];
+  a[0] = getint();
+  a[1] = getint();
+  return a[0] + a[1];
+}

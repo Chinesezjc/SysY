@@ -1,16 +1,39 @@
-use std::collections::HashMap;
-
-use crate::error::{CompilerError, CompilerResult};
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompUnit {
-    pub func: FuncDef,
+    pub items: Vec<GlobalItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GlobalItem {
+    FuncDef(FuncDef),
+    FuncDecl(FuncDecl),
+    Decl(Decl),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FuncDecl {
+    pub ret_type: Type,
+    pub name: String,
+    pub params: Vec<FuncParam>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FuncDef {
+    pub ret_type: Type,
     pub name: String,
+    pub params: Vec<FuncParam>,
     pub body: Block,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Type {
+    Int,
+    Void,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FuncParam {
+    pub name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,19 +56,34 @@ pub enum Decl {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConstDef {
     pub name: String,
+    pub dims: Vec<Expr>,
     pub init: Expr,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VarDef {
     pub name: String,
+    pub dims: Vec<Expr>,
     pub init: Option<Expr>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Stmt {
-    Return(Expr),
-    Assign { name: String, expr: Expr },
+    Return(Option<Expr>),
+    Assign { name: String, index: Vec<Expr>, expr: Expr },
+    Expr(Expr),
+    Block(Block),
+    If {
+        cond: Expr,
+        then_branch: Box<Stmt>,
+        else_branch: Option<Box<Stmt>>,
+    },
+    While {
+        cond: Expr,
+        body: Box<Stmt>,
+    },
+    Break,
+    Continue,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,6 +98,14 @@ pub enum Expr {
         op: BinaryOp,
         lhs: Box<Expr>,
         rhs: Box<Expr>,
+    },
+    Call {
+        name: String,
+        args: Vec<Expr>,
+    },
+    Index {
+        array: Box<Expr>,
+        index: Box<Expr>,
     },
 }
 
@@ -85,47 +131,4 @@ pub enum BinaryOp {
     Ne,
     And,
     Or,
-}
-
-impl Expr {
-    pub fn eval(&self, consts: &HashMap<String, i32>) -> CompilerResult<i32> {
-        match self {
-            Expr::Int(value) => Ok(*value),
-            Expr::LVal(name) => consts
-                .get(name)
-                .copied()
-                .ok_or_else(|| CompilerError::new(format!("'{name}' is not a compile-time constant"))),
-            Expr::Unary { op, expr } => {
-                let value = expr.eval(consts)?;
-                match op {
-                    UnaryOp::Plus => Ok(value),
-                    UnaryOp::Minus => Ok(value.wrapping_neg()),
-                    UnaryOp::Not => Ok((value == 0) as i32),
-                }
-            }
-            Expr::Binary { op, lhs, rhs } => {
-                let lhs = lhs.eval(consts)?;
-                let rhs = rhs.eval(consts)?;
-                match op {
-                    BinaryOp::Mul => Ok(lhs.wrapping_mul(rhs)),
-                    BinaryOp::Div => lhs
-                        .checked_div(rhs)
-                        .ok_or_else(|| CompilerError::new("invalid constant division")),
-                    BinaryOp::Rem => lhs
-                        .checked_rem(rhs)
-                        .ok_or_else(|| CompilerError::new("invalid constant remainder")),
-                    BinaryOp::Add => Ok(lhs.wrapping_add(rhs)),
-                    BinaryOp::Sub => Ok(lhs.wrapping_sub(rhs)),
-                    BinaryOp::Lt => Ok((lhs < rhs) as i32),
-                    BinaryOp::Gt => Ok((lhs > rhs) as i32),
-                    BinaryOp::Le => Ok((lhs <= rhs) as i32),
-                    BinaryOp::Ge => Ok((lhs >= rhs) as i32),
-                    BinaryOp::Eq => Ok((lhs == rhs) as i32),
-                    BinaryOp::Ne => Ok((lhs != rhs) as i32),
-                    BinaryOp::And => Ok((lhs != 0 && rhs != 0) as i32),
-                    BinaryOp::Or => Ok((lhs != 0 || rhs != 0) as i32),
-                }
-            }
-        }
-    }
 }

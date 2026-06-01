@@ -11,6 +11,14 @@ pub enum TokenKind {
     KwInt,
     KwReturn,
     KwConst,
+    KwIf,
+    KwElse,
+    KwWhile,
+    KwBreak,
+    KwContinue,
+    KwVoid,
+    LBracket,
+    RBracket,
     Ident(String),
     IntLiteral(i32),
     LParen,
@@ -89,6 +97,14 @@ impl<'a> Lexer<'a> {
             Some(b'}') => {
                 self.bump();
                 TokenKind::RBrace
+            }
+            Some(b'[') => {
+                self.bump();
+                TokenKind::LBracket
+            }
+            Some(b']') => {
+                self.bump();
+                TokenKind::RBracket
             }
             Some(b';') => {
                 self.bump();
@@ -230,6 +246,12 @@ impl<'a> Lexer<'a> {
             "int" => TokenKind::KwInt,
             "return" => TokenKind::KwReturn,
             "const" => TokenKind::KwConst,
+            "if" => TokenKind::KwIf,
+            "else" => TokenKind::KwElse,
+            "while" => TokenKind::KwWhile,
+            "break" => TokenKind::KwBreak,
+            "continue" => TokenKind::KwContinue,
+            "void" => TokenKind::KwVoid,
             ident => TokenKind::Ident(ident.to_string()),
         }
     }
