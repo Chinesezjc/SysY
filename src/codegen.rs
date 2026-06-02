@@ -835,10 +835,12 @@ enum RvSymbol {
     Const(i32),
     Var { offset: i32 },
     Array { offset: i32, dims: Vec<i32> },
+    Global(String),
 }
 
 struct RiscvGen {
     scopes: Vec<HashMap<String, RvSymbol>>,
+    globals: HashMap<String, RvSymbol>,
     var_offsets: HashMap<String, i32>,
     mangled_names: HashMap<String, Vec<String>>,
     read_pos: HashMap<String, usize>,
@@ -847,6 +849,7 @@ struct RiscvGen {
     label: usize,
     loop_stack: Vec<(String, String)>,
     current_ret_type: Type,
+    data_section: String,
     out: String,
 }
 
@@ -854,6 +857,7 @@ impl RiscvGen {
     fn new() -> Self {
         Self {
             scopes: vec![HashMap::new()],
+            globals: HashMap::new(),
             var_offsets: HashMap::new(),
             mangled_names: HashMap::new(),
             read_pos: HashMap::new(),
@@ -862,6 +866,7 @@ impl RiscvGen {
             label: 0,
             loop_stack: Vec::new(),
             current_ret_type: Type::Int,
+            data_section: String::new(),
             out: String::new(),
         }
     }
@@ -896,7 +901,7 @@ impl RiscvGen {
                 return Some(sym);
             }
         }
-        None
+        self.globals.get(name)
     }
 
     fn current_scope_contains(&self, name: &str) -> bool {
@@ -918,7 +923,45 @@ impl RiscvGen {
     }
 
     fn gen_program(mut self, program: &CompUnit) -> CompilerResult<String> {
+        // First pass: collect global declarations
+        let mut const_vals: HashMap<String, i32> = HashMap::new();
+        for item in &program.items {
+            if let GlobalItem::Decl(decl) = item {
+                match decl {
+                    Decl::Const(defs) => {
+                        for def in defs {
+                            let val = Self::collect_eval_const(&def.init, &const_vals);
+                            const_vals.insert(def.name.clone(), val);
+                            self.globals.insert(def.name.clone(), RvSymbol::Const(val));
+                        }
+                    }
+                    Decl::Var(defs) => {
+                        for def in defs {
+                            let label = def.name.clone();
+                            if def.dims.is_empty() {
+                                let init_val = def.init.as_ref()
+                                    .map(|e| Self::collect_eval_const(e, &const_vals))
+                                    .unwrap_or(0);
+                                self.data_section.push_str(&format!("{}:\n  .word {}\n", label, init_val));
+                            } else {
+                                let dims: Vec<i32> = def.dims.iter()
+                                    .map(|d| Self::collect_eval_const(d, &const_vals))
+                                    .collect();
+                                let total: i32 = dims.iter().product();
+                                self.data_section.push_str(&format!("{}:\n  .zero {}\n", label, total * 4));
+                            }
+                            self.globals.insert(label.clone(), RvSymbol::Global(label));
+                        }
+                    }
+                }
+            }
+        }
+
         let mut out = String::new();
+        if !self.data_section.is_empty() {
+            out.push_str("  .data\n");
+            out.push_str(&self.data_section);
+        }
         out.push_str("  .text\n");
 
         for item in &program.items {
@@ -1177,8 +1220,19 @@ impl RiscvGen {
             }
             Stmt::Assign { name, index, expr } => {
                 if index.is_empty() {
-                    let offset = match self.lookup(name) {
-                        Some(RvSymbol::Var { offset }) => *offset,
+                    match self.lookup(name) {
+                        Some(RvSymbol::Var { offset }) => {
+                            let off = *offset;
+                            self.gen_expr(expr, frame)?;
+                            self.emit(&format!("sw a0, {off}(sp)"));
+                        }
+                        Some(RvSymbol::Global(label)) => {
+                            let l = label.clone();
+                            self.gen_expr(expr, frame)?;
+                            self.emit("mv t0, a0");
+                            self.emit(&format!("la t1, {l}"));
+                            self.emit("sw t0, 0(t1)");
+                        }
                         Some(RvSymbol::Const(_)) => {
                             return Err(CompilerError::new(format!(
                                 "cannot assign to constant '{name}'"
@@ -1195,8 +1249,6 @@ impl RiscvGen {
                             )));
                         }
                     };
-                    self.gen_expr(expr, frame)?;
-                    self.emit(&format!("sw a0, {offset}(sp)"));
                 } else {
                     let (arr_offset, arr_dims) = match self.lookup(name) {
                         Some(RvSymbol::Array { offset, dims }) => (*offset, dims.clone()),
@@ -1361,6 +1413,11 @@ impl RiscvGen {
                 }
                 Some(RvSymbol::Array { offset, .. }) => {
                     self.emit(&format!("addi a0, sp, {}", offset + self.extra_sp));
+                }
+                Some(RvSymbol::Global(label)) => {
+                    let l = label.clone();
+                    self.emit(&format!("la a0, {l}"));
+                    self.emit("lw a0, 0(a0)");
                 }
                 None => {
                     return Err(CompilerError::new(format!(
