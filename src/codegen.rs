@@ -54,6 +54,7 @@ struct KoopaGen {
     global_decls: String,
     func_ret_types: HashMap<String, Type>,
     pending_sc_allocas: Vec<String>,
+    block_terminated: bool,
 }
 
 impl KoopaGen {
@@ -73,6 +74,7 @@ impl KoopaGen {
             global_decls: String::new(),
             func_ret_types: HashMap::new(),
             pending_sc_allocas: Vec::new(),
+            block_terminated: false,
         }
     }
 
@@ -117,7 +119,7 @@ impl KoopaGen {
     fn alloc_sc(&mut self) -> String {
         let t = format!("@sc_{}", self.sc_count);
         self.sc_count += 1;
-        self.pending_sc_allocas.push(format!("{t} = alloca i32"));
+        self.pending_sc_allocas.push(format!("{t} = alloc i32"));
         t
     }
 
@@ -136,6 +138,7 @@ impl KoopaGen {
     fn emit_label(&mut self, label: &str) {
         self.body.push_str(label);
         self.body.push_str(":\n");
+        self.block_terminated = false;
     }
 
     fn emit_decl(&mut self, s: &str) {
@@ -148,16 +151,12 @@ impl KoopaGen {
             return;
         }
         self.lib_funcs_emitted.insert(name.to_string());
-        if let Some((_, _, param_types)) = LIB_FUNCS.iter().find(|(n, _, _)| *n == name) {
+        if let Some((_, ret_ty, param_types)) = LIB_FUNCS.iter().find(|(n, _, _)| *n == name) {
             let params: Vec<String> = param_types
                 .iter()
-                .enumerate()
-                .map(|(i, t)| {
-                    let t_str = match t {
-                        Type::Int => "i32",
-                        Type::Void => "void",
-                    };
-                    format!("@p{i}: {t_str}")
+                .map(|t| match t {
+                    Type::Int => "i32".to_string(),
+                    Type::Void => unreachable!(),
                 })
                 .collect();
             let params_str = if params.is_empty() {
@@ -165,14 +164,18 @@ impl KoopaGen {
             } else {
                 params.join(", ")
             };
-            self.emit_decl(&format!("decl @{name}({params_str})"));
+            let ret_str = match ret_ty {
+                Type::Int => ": i32",
+                Type::Void => "",
+            };
+            self.emit_decl(&format!("decl @{name}({params_str}){ret_str}"));
         }
     }
 
     fn type_str(t: Type) -> &'static str {
         match t {
             Type::Int => "i32",
-            Type::Void => "void",
+            Type::Void => "",
         }
     }
 
@@ -244,9 +247,12 @@ impl KoopaGen {
 
                     // Add function params to scope
                     for param in &func.params {
+                        // Reserve source name for function signature param
+                        self.mangle(&param.name);
+                        // Use a unique name for the local alloca
                         let koopa_name = self.mangle(&param.name);
                         self.pending_sc_allocas
-                            .push(format!("@{koopa_name} = alloca i32"));
+                            .push(format!("@{koopa_name} = alloc i32"));
                         self.emit(&format!(
                             "store @{}, @{}",
                             param.name, koopa_name
@@ -280,10 +286,15 @@ impl KoopaGen {
 
                     let ret_str = Self::type_str(func.ret_type);
                     let header = format!("fun @{}", func.name);
-                    let header = if params_sig.is_empty() {
-                        format!("{header}(): {ret_str} {{\n%entry:")
+                    let ret_part = if ret_str.is_empty() {
+                        String::new()
                     } else {
-                        format!("{header}({params_sig}): {ret_str} {{\n%entry:")
+                        format!(": {ret_str}")
+                    };
+                    let header = if params_sig.is_empty() {
+                        format!("{header}(){ret_part} {{\n%entry:")
+                    } else {
+                        format!("{header}({params_sig}){ret_part} {{\n%entry:")
                     };
 
                     let func_str = format!(
@@ -410,7 +421,7 @@ impl KoopaGen {
                     let koopa_name = self.mangle(&def.name);
                     if def.dims.is_empty() {
                         self.pending_sc_allocas
-                            .push(format!("@{koopa_name} = alloca i32"));
+                            .push(format!("@{koopa_name} = alloc i32"));
                         if let Some(init) = &def.init {
                             let val = self.gen_expr(init)?;
                             self.emit(&format!("store {val}, @{koopa_name}"));
@@ -451,6 +462,7 @@ impl KoopaGen {
                 } else {
                     self.emit("ret");
                 }
+                self.block_terminated = true;
             }
             Stmt::Assign { name, index, expr } => {
                 if index.is_empty() {
@@ -519,29 +531,48 @@ impl KoopaGen {
                 } else {
                     self.emit(&format!("br {cond_val}, {then_label}, {end_label}"));
                 }
+                self.block_terminated = true;
                 self.emit_label(&then_label);
                 self.gen_stmt(then_branch)?;
-                self.emit(&format!("jump {end_label}"));
+                let then_terminated = self.block_terminated;
+                if !then_terminated {
+                    self.emit(&format!("jump {end_label}"));
+                    self.block_terminated = true;
+                }
+                let mut else_terminated = false;
                 if let Some(else_s) = else_branch {
                     self.emit_label(&else_label);
                     self.gen_stmt(else_s)?;
-                    self.emit(&format!("jump {end_label}"));
+                    else_terminated = self.block_terminated;
+                    if !else_terminated {
+                        self.emit(&format!("jump {end_label}"));
+                        self.block_terminated = true;
+                    }
                 }
-                self.emit_label(&end_label);
+                // Emit end_label only if some path can reach it
+                let need_end = else_branch.is_none() || !then_terminated || !else_terminated;
+                if need_end {
+                    self.emit_label(&end_label);
+                }
             }
             Stmt::While { cond, body } => {
                 let entry_label = self.new_label();
                 let body_label = self.new_label();
                 let end_label = self.new_label();
                 self.emit(&format!("jump {entry_label}"));
+                self.block_terminated = true;
                 self.emit_label(&entry_label);
                 let cond_val = self.gen_expr(cond)?;
                 self.emit(&format!("br {cond_val}, {body_label}, {end_label}"));
+                self.block_terminated = true;
                 self.loop_stack
                     .push((entry_label.clone(), end_label.clone()));
                 self.emit_label(&body_label);
                 self.gen_stmt(body)?;
-                self.emit(&format!("jump {entry_label}"));
+                if !self.block_terminated {
+                    self.emit(&format!("jump {entry_label}"));
+                    self.block_terminated = true;
+                }
                 self.loop_stack.pop();
                 self.emit_label(&end_label);
             }
@@ -552,6 +583,7 @@ impl KoopaGen {
                     .ok_or_else(|| CompilerError::new("'break' outside of loop"))?;
                 let label = break_label.clone();
                 self.emit(&format!("jump {label}"));
+                self.block_terminated = true;
             }
             Stmt::Continue => {
                 let (continue_label, _) = self
@@ -560,6 +592,7 @@ impl KoopaGen {
                     .ok_or_else(|| CompilerError::new("'continue' outside of loop"))?;
                 let label = continue_label.clone();
                 self.emit(&format!("jump {label}"));
+                self.block_terminated = true;
             }
         }
         Ok(())
