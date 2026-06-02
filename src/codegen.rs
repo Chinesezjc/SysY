@@ -241,6 +241,7 @@ impl KoopaGen {
                     self.label = 0;
                     self.sc_count = 0;
                     self.loop_stack.clear();
+                    self.block_terminated = false;
 
                     // Emit lib decls for called functions
                     self.gen_block_for_lib_decls(&func.body)?;
@@ -385,6 +386,9 @@ impl KoopaGen {
 
     fn gen_block(&mut self, block: &Block) -> CompilerResult<()> {
         for item in &block.items {
+            if self.block_terminated {
+                break;
+            }
             match item {
                 BlockItem::Decl(d) => self.gen_decl(d)?,
                 BlockItem::Stmt(s) => self.gen_stmt(s)?,
