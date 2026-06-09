@@ -422,6 +422,10 @@ impl KoopaGen {
                             def.name
                         )));
                     }
+                    // Reserve base name if local shadows a global
+                    if self.globals.contains_key(&def.name) {
+                        self.mangle(&def.name);
+                    }
                     let koopa_name = self.mangle(&def.name);
                     if def.dims.is_empty() {
                         self.pending_sc_allocas
