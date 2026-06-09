@@ -260,6 +260,10 @@ impl Parser {
                 let block = self.parse_block()?;
                 Ok(Stmt::Block(block))
             }
+            TokenKind::Semicolon => {
+                self.advance();
+                Ok(Stmt::Empty)
+            }
             _ => {
                 let expr = self.parse_expr()?;
                 self.expect_semicolon()?;

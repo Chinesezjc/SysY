@@ -84,6 +84,7 @@ pub enum Stmt {
     },
     Break,
     Continue,
+    Empty,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

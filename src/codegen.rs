@@ -266,6 +266,12 @@ impl KoopaGen {
 
                     self.gen_block(&func.body)?;
 
+                    // Ensure void functions have a ret at end
+                    if func.ret_type == Type::Void && !self.block_terminated {
+                        self.emit("ret");
+                        self.block_terminated = true;
+                    }
+
                     // Emit pending allocas in entry block
                     let mut entry_allocas = String::new();
                     for inst in &self.pending_sc_allocas {
@@ -602,6 +608,7 @@ impl KoopaGen {
                 self.emit(&format!("jump {label}"));
                 self.block_terminated = true;
             }
+            Stmt::Empty => {}
         }
         Ok(())
     }
@@ -1349,6 +1356,7 @@ impl RiscvGen {
                 let label = continue_label.clone();
                 self.emit(&format!("j {label}"));
             }
+            Stmt::Empty => {}
         }
         Ok(())
     }
