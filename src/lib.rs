@@ -1,8 +1,10 @@
 mod ast;
 mod codegen;
 mod error;
+mod koopa_gen;
 mod lexer;
 mod parser;
+mod riscv_gen;
 
 pub use error::{CompilerError, CompilerResult};
 
