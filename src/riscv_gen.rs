@@ -327,33 +327,28 @@ impl RiscvGen {
 
     fn flatten_init_vals(&self, dims: &[i32], init: &Expr, vals: &mut Vec<i32>) {
         let total: usize = dims.iter().map(|&d| d as usize).product();
+        let inner_dim = *dims.last().unwrap_or(&1) as usize;
         match init {
             Expr::InitList(items) => {
                 if items.is_empty() { return; }
-                let has_nested = items.iter().any(|i| matches!(i, Expr::InitList(_)));
-                if dims.len() <= 1 || !has_nested {
-                    for item in items {
-                        match item {
-                            Expr::InitList(_) => self.flatten_init_vals(&[], item, vals),
-                            Expr::Int(n) => vals.push(*n),
-                            e => vals.push(self.eval_const(e).unwrap_or(0)),
-                        }
-                    }
-                } else {
-                    let sub_dims = &dims[1..];
-                    let sub_size: usize = sub_dims.iter().map(|&d| d as usize).product();
-                    for item in items {
-                        let before = vals.len();
-                        match item {
-                            Expr::InitList(_) => self.flatten_init_vals(sub_dims, item, vals),
-                            e => {
-                                let val = self.eval_const(e).unwrap_or(0);
-                                vals.push(val);
+                for item in items {
+                    match item {
+                        Expr::InitList(inner_items) => {
+                            if inner_items.is_empty() {
+                                // Empty {}: align to innermost boundary, skip
+                                let rem = (inner_dim - vals.len() % inner_dim) % inner_dim;
+                                for _ in 0..rem { vals.push(0); }
+                            } else {
+                                // Nested init: align to innermost boundary, then process
+                                let rem = (inner_dim - vals.len() % inner_dim) % inner_dim;
+                                for _ in 0..rem { vals.push(0); }
+                                // Recurse with sub_dims; if 1D, sub_dims is empty
+                                let sub_dims = if dims.len() > 1 { &dims[1..] } else { &[] };
+                                self.flatten_init_vals(sub_dims, item, vals);
                             }
                         }
-                        let after = vals.len();
-                        let remainder = (sub_size - (after - before) % sub_size) % sub_size;
-                        for _ in 0..remainder { vals.push(0); }
+                        Expr::Int(n) => vals.push(*n),
+                        e => vals.push(self.eval_const(e).unwrap_or(0)),
                     }
                 }
                 while vals.len() < total { vals.push(0); }
