@@ -123,6 +123,16 @@ impl RiscvGen {
         else { self.emit(&format!("li t0, {offset}")); self.emit("add t0, sp, t0"); self.emit(&format!("sw {rs}, 0(t0)")); }
     }
 
+    /// Emit addi with potentially large immediate (uses t0 as scratch)
+    fn emit_addi_large(&mut self, rd: &str, rs: &str, imm: i32) {
+        if imm >= -2048 && imm < 2048 {
+            self.emit(&format!("addi {rd}, {rs}, {imm}"));
+        } else {
+            self.emit(&format!("li t0, {imm}"));
+            self.emit(&format!("add {rd}, {rs}, t0"));
+        }
+    }
+
     pub(crate) fn gen_program(mut self, program: &CompUnit) -> CompilerResult<String> {
         // First pass: collect global declarations
         let mut global_const_vals: HashMap<String, i32> = HashMap::new();
@@ -615,7 +625,7 @@ impl RiscvGen {
                                 if i == 0 { self.emit("mv t2, a0"); } else { self.emit("add t2, t2, a0"); }
                             }
                             self.emit("slli t2, t2, 2");
-                            self.emit(&format!("addi t2, t2, {}", arr_offset + self.extra_sp));
+                            self.emit_addi_large("t2", "t2", arr_offset + self.extra_sp);
                             self.emit("add t2, sp, t2");
                             self.emit("sw t1, 0(t2)");
                         }
@@ -832,7 +842,7 @@ impl RiscvGen {
                     self.emit_lw("a0", addr);
                 }
                 Some(RvSymbol::Array { offset, .. }) => {
-                    self.emit(&format!("addi a0, sp, {}", offset + self.extra_sp));
+                    self.emit_addi_large("a0", "sp", offset + self.extra_sp);
                 }
                 Some(RvSymbol::PtrArray { offset }) => {
                     let addr = offset + self.extra_sp;
@@ -948,7 +958,7 @@ impl RiscvGen {
                                 if i == 0 { self.emit("mv t2, a0"); } else { self.emit("add t2, t2, a0"); }
                             }
                             self.emit("slli t2, t2, 2");
-                            self.emit(&format!("addi t2, t2, {}", arr_offset + self.extra_sp));
+                            self.emit_addi_large("t2", "t2", arr_offset + self.extra_sp);
                             self.emit("add t2, sp, t2");
                             if indices.len() >= total_dims { self.emit("lw a0, 0(t2)"); } else { self.emit("mv a0, t2"); }
                         }
