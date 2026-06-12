@@ -667,23 +667,16 @@ impl KoopaGen {
                             let n = param_name.clone();
                             let dims = dims.clone();
                             let val = self.gen_expr(expr)?;
-                            let total_dims = 1 + dims.len();
+                            // Spec: first index → getptr, remaining → getelemptr
                             let first_idx = self.gen_expr(&index[0])?;
                             let p = self.alloc_tmp();
                             self.emit(&format!("{p} = getptr @{n}, {first_idx}"));
-                            let p0 = self.alloc_tmp();
-                            self.emit(&format!("{p0} = getelemptr {p}, 0"));
-                            let mut ptr = p0;
+                            let mut ptr = p;
                             for (i, idx) in index.iter().enumerate().skip(1) {
                                 let idx_val = self.gen_expr(idx)?;
                                 let p1 = self.alloc_tmp();
-                                self.emit(&format!("{p1} = getptr {ptr}, {idx_val}"));
+                                self.emit(&format!("{p1} = getelemptr {ptr}, {idx_val}"));
                                 ptr = p1;
-                                if i < total_dims - 1 {
-                                    let p2 = self.alloc_tmp();
-                                    self.emit(&format!("{p2} = getelemptr {ptr}, 0"));
-                                    ptr = p2;
-                                }
                             }
                             self.emit(&format!("store {val}, {ptr}"));
                         }
@@ -1118,29 +1111,26 @@ impl KoopaGen {
         indices.reverse();
         let total_dims = 1 + dims.len();
 
+        // Spec: first index → getptr, remaining → getelemptr
         let first_idx = self.gen_expr(indices[0])?;
         let p = self.alloc_tmp();
         self.emit(&format!("{p} = getptr @{base_name}, {first_idx}"));
-        let p0 = self.alloc_tmp();
-        self.emit(&format!("{p0} = getelemptr {p}, 0"));
-        let mut ptr = p0;
+        let mut ptr = p;
         for (i, idx) in indices.iter().enumerate().skip(1) {
             let idx_val = self.gen_expr(idx)?;
             let p1 = self.alloc_tmp();
-            self.emit(&format!("{p1} = getptr {ptr}, {idx_val}"));
+            self.emit(&format!("{p1} = getelemptr {ptr}, {idx_val}"));
             ptr = p1;
-            if i < total_dims - 1 {
-                let p2 = self.alloc_tmp();
-                self.emit(&format!("{p2} = getelemptr {ptr}, 0"));
-                ptr = p2;
-            }
         }
         if indices.len() >= total_dims {
             let result = self.alloc_tmp();
             self.emit(&format!("{result} = load {ptr}"));
             Ok(result)
         } else {
-            Ok(ptr)
+            // Partial indexing: decay array pointer to element pointer
+            let decay = self.alloc_tmp();
+            self.emit(&format!("{decay} = getelemptr {ptr}, 0"));
+            Ok(decay)
         }
     }
 
