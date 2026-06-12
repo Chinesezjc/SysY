@@ -9,10 +9,10 @@ use crate::error::{CompilerError, CompilerResult};
 pub(crate) enum RvSymbol {
     Const(i32),
     Var { offset: i32 },
-    Array { offset: i32, dims: Vec<i32> },
+    Array { offset: i32, dims: Vec<i32>, init_vals: Vec<i32> },
     PtrArray { offset: i32 },
     NdParam { offset: i32, dims: Vec<i32> },
-    Global(String, Vec<i32>),
+    Global(String, Vec<i32>, Vec<i32>),
 }
 
 pub(crate) struct RiscvGen {
@@ -133,6 +133,20 @@ impl RiscvGen {
         }
     }
 
+    /// Push t2 to stack (save accumulator during nested array index eval)
+    fn emit_push_t2(&mut self) {
+        self.emit("addi sp, sp, -4");
+        self.emit("sw t2, 0(sp)");
+        self.extra_sp += 4;
+    }
+
+    /// Pop t2 from stack (restore accumulator after nested array index eval)
+    fn emit_pop_t2(&mut self) {
+        self.emit("lw t2, 0(sp)");
+        self.emit("addi sp, sp, 4");
+        self.extra_sp -= 4;
+    }
+
     pub(crate) fn gen_program(mut self, program: &CompUnit) -> CompilerResult<String> {
         // First pass: collect global declarations
         let mut global_const_vals: HashMap<String, i32> = HashMap::new();
@@ -163,7 +177,7 @@ impl RiscvGen {
                                 if remaining > 0 {
                                     self.data_section.push_str(&format!("  .zero {}\n", remaining * 4));
                                 }
-                                self.globals.insert(label.clone(), RvSymbol::Global(label, dims));
+                                self.globals.insert(label.clone(), RvSymbol::Global(label, dims, vals));
                             }
                         }
                     }
@@ -175,7 +189,7 @@ impl RiscvGen {
                                     .map(|e| Self::collect_eval_const(e, &global_const_vals))
                                     .unwrap_or(0);
                                 self.data_section.push_str(&format!("{}:\n  .word {}\n", label, init_val));
-                                self.globals.insert(label.clone(), RvSymbol::Global(label, vec![]));
+                                self.globals.insert(label.clone(), RvSymbol::Global(label, vec![], vec![]));
                             } else {
                                 let dims: Vec<i32> = def.dims.iter()
                                     .map(|d| Self::collect_eval_const(d, &global_const_vals))
@@ -183,8 +197,8 @@ impl RiscvGen {
                                 let total: i32 = dims.iter().product();
                                 self.data_section.push_str(&format!("{}:\n", label));
                                 // Emit initializer values or zeros
+                                let mut vals = Vec::new();
                                 if let Some(init) = &def.init {
-                                    let mut vals = Vec::new();
                                     self.flatten_init_vals(dims.as_slice(), init, &mut vals);
                                     let total_usize = total as usize;
                                     if vals.len() > total_usize { vals.truncate(total_usize); }
@@ -198,7 +212,7 @@ impl RiscvGen {
                                 } else {
                                     self.data_section.push_str(&format!("  .zero {}\n", total * 4));
                                 }
-                                self.globals.insert(label.clone(), RvSymbol::Global(label, dims));
+                                self.globals.insert(label.clone(), RvSymbol::Global(label, dims, vals));
                             }
                         }
                     }
@@ -245,7 +259,7 @@ impl RiscvGen {
                         slot += 1;
                     }
 
-                    let mut const_vals: HashMap<String, i32> = HashMap::new();
+                    let mut const_vals: HashMap<String, i32> = global_const_vals.clone();
                     self.collect_vars(&func.body, &mut slot, &mut name_count, &mut const_vals);
 
                     let num_vars = slot;
@@ -326,6 +340,7 @@ impl RiscvGen {
     }
 
     fn flatten_init_vals(&self, dims: &[i32], init: &Expr, vals: &mut Vec<i32>) {
+        let start_len = vals.len();
         let total: usize = dims.iter().map(|&d| d as usize).product();
         let inner_dim = *dims.last().unwrap_or(&1) as usize;
         match init {
@@ -333,27 +348,31 @@ impl RiscvGen {
                 if items.is_empty() { return; }
                 for item in items {
                     match item {
-                        Expr::InitList(inner_items) => {
-                            if inner_items.is_empty() {
-                                // Empty {}: align to innermost boundary, skip
-                                let rem = (inner_dim - vals.len() % inner_dim) % inner_dim;
-                                for _ in 0..rem { vals.push(0); }
-                            } else {
-                                // Nested init: align to innermost boundary, then process
-                                let rem = (inner_dim - vals.len() % inner_dim) % inner_dim;
-                                for _ in 0..rem { vals.push(0); }
-                                // Recurse with sub_dims; if 1D, sub_dims is empty
-                                let sub_dims = if dims.len() > 1 { &dims[1..] } else { &[] };
-                                self.flatten_init_vals(sub_dims, item, vals);
+                        Expr::InitList(_) => {
+                            // Align to innermost boundary
+                            let rem = (inner_dim - (vals.len() - start_len) % inner_dim) % inner_dim;
+                            for _ in 0..rem { vals.push(0); }
+                            // Process the sub-init (fills one complete sub-array)
+                            let sub_start = vals.len();
+                            let sub_dims = if dims.len() > 1 { &dims[1..] } else { &[] };
+                            let sub_total: usize = sub_dims.iter().map(|&d| d as usize).product();
+                            if sub_dims.is_empty() {
+                                // 1D: just pad inner_dim
                             }
+                            self.flatten_init_vals(sub_dims, item, vals);
+                            // Pad to fill the sub-array (advance to next sub-array boundary)
+                            let sub_end = sub_start + if sub_dims.is_empty() { inner_dim } else { sub_total * inner_dim / inner_dim };
+                            // Actually: pad so that vals.len() reaches start of next sub-array
+                            let target = sub_start + if sub_dims.is_empty() { inner_dim } else { sub_total };
+                            while vals.len() < target { vals.push(0); }
                         }
                         Expr::Int(n) => vals.push(*n),
                         e => vals.push(self.eval_const(e).unwrap_or(0)),
                     }
                 }
-                while vals.len() < total { vals.push(0); }
+                while vals.len() < start_len + total { vals.push(0); }
             }
-            Expr::Int(n) => { vals.push(*n); while vals.len() < total { vals.push(0); } }
+            Expr::Int(n) => { vals.push(*n); while vals.len() < start_len + total { vals.push(0); } }
             _ => {}
         }
     }
@@ -493,20 +512,18 @@ impl RiscvGen {
                             .map(|d| self.eval_const(d))
                             .collect::<CompilerResult<_>>()?;
                         // Emit init values for const arrays
-                        {
-                            let mut vals = Vec::new();
-                            self.flatten_init_vals(&dims, &def.init, &mut vals);
-                            let total_usize: usize = dims.iter().map(|&d| d as usize).product();
-                            if vals.len() > total_usize { vals.truncate(total_usize); }
-                            for (i, v) in vals.iter().enumerate() {
-                                self.emit(&format!("li t0, {}", v));
-                                let off = adjusted_offset + i as i32 * 4;
-                                self.emit_sw("t0", off);
-                            }
+                        let mut vals = Vec::new();
+                        self.flatten_init_vals(&dims, &def.init, &mut vals);
+                        let total_usize: usize = dims.iter().map(|&d| d as usize).product();
+                        if vals.len() > total_usize { vals.truncate(total_usize); }
+                        for (i, v) in vals.iter().enumerate() {
+                            self.emit(&format!("li t0, {}", v));
+                            let off = adjusted_offset + i as i32 * 4;
+                            self.emit_sw("t0", off);
                         }
                         self.scopes.last_mut().unwrap().insert(
                             def.name.clone(),
-                            RvSymbol::Array { offset: adjusted_offset, dims },
+                            RvSymbol::Array { offset: adjusted_offset, dims, init_vals: vals },
                         );
                     }
                 }
@@ -537,8 +554,8 @@ impl RiscvGen {
                             .map(|d| self.eval_const(d))
                             .collect::<CompilerResult<_>>()?;
                         // Emit init values if present
+                        let mut vals = Vec::new();
                         if let Some(init) = &def.init {
-                            let mut vals = Vec::new();
                             self.flatten_init_vals(&dims, init, &mut vals);
                             let total_usize: usize = dims.iter().map(|&d| d as usize).product();
                             if vals.len() > total_usize { vals.truncate(total_usize); }
@@ -553,6 +570,7 @@ impl RiscvGen {
                             RvSymbol::Array {
                                 offset: adjusted_offset,
                                 dims,
+                                init_vals: vals,
                             },
                         );
                     }
@@ -582,7 +600,7 @@ impl RiscvGen {
                             self.gen_expr(expr, frame)?;
                             self.emit_sw("a0", off);
                         }
-                        Some(RvSymbol::Global(label, _)) => {
+                        Some(RvSymbol::Global(label, _, _)) => {
                             let l = label.clone();
                             self.gen_expr(expr, frame)?;
                             self.emit("mv t0, a0");
@@ -608,7 +626,7 @@ impl RiscvGen {
                 } else {
                     let sym = self.lookup(name).cloned();
                     match sym {
-                        Some(RvSymbol::Array { offset, dims }) => {
+                        Some(RvSymbol::Array { offset, dims, .. }) => {
                             let arr_offset = offset;
                             let arr_dims = dims.clone();
                             self.gen_expr(expr, frame)?;
@@ -634,7 +652,9 @@ impl RiscvGen {
                             self.gen_expr(expr, frame)?;
                             self.emit("mv t1, a0");
                             for (i, idx) in index.iter().enumerate() {
+                                if i > 0 { self.emit_push_t2(); }
                                 self.gen_expr(idx, frame)?;
+                                if i > 0 { self.emit_pop_t2(); }
                                 self.emit("slli a0, a0, 2");
                                 if i == 0 { self.emit("mv t2, a0"); } else { self.emit("add t2, t2, a0"); }
                             }
@@ -655,7 +675,9 @@ impl RiscvGen {
                             self.gen_expr(expr, frame)?;
                             self.emit("mv t1, a0");
                             for (i, idx) in index.iter().enumerate() {
+                                if i > 0 { self.emit_push_t2(); }
                                 self.gen_expr(idx, frame)?;
+                                if i > 0 { self.emit_pop_t2(); }
                                 let stride: i32 = if i == 0 { dims.iter().product() } else { dims.iter().skip(i).product() };
                                 if stride != 1 { self.emit(&format!("li t0, {}", stride)); self.emit("mul a0, a0, t0"); }
                                 if i == 0 { self.emit("mv t2, a0"); } else { self.emit("add t2, t2, a0"); }
@@ -668,7 +690,7 @@ impl RiscvGen {
                             self.emit("add t2, t4, t2");
                             self.emit("sw t1, 0(t2)");
                         }
-                        Some(RvSymbol::Global(label, dims)) if !dims.is_empty() => {
+                        Some(RvSymbol::Global(label, dims, _)) if !dims.is_empty() => {
                             let l = label.clone();
                             let arr_dims = dims.clone();
                             self.emit(&format!("la t3, {l}"));
@@ -679,7 +701,9 @@ impl RiscvGen {
                             self.gen_expr(expr, frame)?;
                             self.emit("mv t1, a0");
                             for (i, idx) in index.iter().enumerate() {
+                                if i > 0 { self.emit_push_t2(); }
                                 self.gen_expr(idx, frame)?;
+                                if i > 0 { self.emit_pop_t2(); }
                                 let stride: i32 = arr_dims.iter().skip(i + 1).product();
                                 if stride != 1 { self.emit(&format!("li t0, {}", stride)); self.emit("mul a0, a0, t0"); }
                                 if i == 0 { self.emit("mv t2, a0"); } else { self.emit("add t2, t2, a0"); }
@@ -769,6 +793,43 @@ impl RiscvGen {
         Ok(())
     }
 
+    fn eval_const_index(&self, array: &Expr, index: &Expr) -> CompilerResult<i32> {
+        // Decompose nested index chain: a[i][j] → base=a, indices=[i, j]
+        let mut indices: Vec<&Expr> = vec![index];
+        let mut base: &Expr = array;
+        while let Expr::Index { array: inner_arr, index: inner_idx } = base {
+            indices.push(inner_idx);
+            base = inner_arr;
+        }
+        indices.reverse();
+        let name = match base {
+            Expr::LVal(n) => n,
+            _ => return Err(CompilerError::new("array base is not a variable")),
+        };
+
+        // Look up the array symbol and get dims + init_vals
+        let (dims, init_vals) = match self.lookup(name) {
+            Some(RvSymbol::Array { dims, init_vals, .. }) => (dims.clone(), init_vals.clone()),
+            Some(RvSymbol::Global(_, dims, init_vals)) => (dims.clone(), init_vals.clone()),
+            _ => return Err(CompilerError::new(format!("'{name}' is not a const array"))),
+        };
+
+        // Compute flat offset using strides
+        let mut flat: i32 = 0;
+        for (i, idx) in indices.iter().enumerate() {
+            let idx_val = self.eval_const(idx)?;
+            let stride: i32 = dims.iter().skip(i + 1).product();
+            flat += idx_val * stride;
+        }
+
+        // Look up the value
+        init_vals.get(flat as usize).copied()
+            .ok_or_else(|| CompilerError::new(format!(
+                "const array index out of bounds: index {flat}, len {}",
+                init_vals.len()
+            )))
+    }
+
     fn eval_const(&self, expr: &Expr) -> CompilerResult<i32> {
         match expr {
             Expr::Int(value) => Ok(*value),
@@ -812,9 +873,9 @@ impl RiscvGen {
             Expr::Call { .. } => Err(CompilerError::new(
                 "function call is not a compile-time constant",
             )),
-            Expr::Index { .. } => Err(CompilerError::new(
-                "array access is not a compile-time constant",
-            )),
+            Expr::Index { array, index } => {
+                self.eval_const_index(array, index)
+            }
             Expr::InitList(_) => Err(CompilerError::new(
                 "initializer list is not a compile-time constant",
             )),
@@ -847,7 +908,7 @@ impl RiscvGen {
                     let addr = offset + self.extra_sp;
                     self.emit_lw("a0", addr);
                 }
-                Some(RvSymbol::Global(label, dims)) => {
+                Some(RvSymbol::Global(label, dims, _)) => {
                     let l = label.clone();
                     self.emit(&format!("la a0, {l}"));
                     if dims.is_empty() {
@@ -942,12 +1003,14 @@ impl RiscvGen {
                 if let Expr::LVal(name) = base {
                     let sym = self.lookup(name).cloned();
                     match sym {
-                        Some(RvSymbol::Array { offset, dims }) => {
+                        Some(RvSymbol::Array { offset, dims, .. }) => {
                             let arr_offset = offset;
                             let arr_dims = dims.clone();
                             let total_dims = arr_dims.len();
                             for (i, idx) in indices.iter().enumerate() {
+                                if i > 0 { self.emit_push_t2(); }
                                 self.gen_expr(idx, frame)?;
+                                if i > 0 { self.emit_pop_t2(); }
                                 let stride: i32 = arr_dims.iter().skip(i + 1).product();
                                 if stride != 1 { self.emit(&format!("li t1, {}", stride)); self.emit("mul a0, a0, t1"); }
                                 if i == 0 { self.emit("mv t2, a0"); } else { self.emit("add t2, t2, a0"); }
@@ -965,7 +1028,9 @@ impl RiscvGen {
                             self.emit("sw t3, 0(sp)");
                             self.extra_sp += 4;
                             for (i, idx) in indices.iter().enumerate() {
+                                if i > 0 { self.emit_push_t2(); }
                                 self.gen_expr(idx, frame)?;
+                                if i > 0 { self.emit_pop_t2(); }
                                 self.emit("slli a0, a0, 2");
                                 if i == 0 { self.emit("mv t2, a0"); } else { self.emit("add t2, t2, a0"); }
                             }
@@ -985,7 +1050,9 @@ impl RiscvGen {
                             self.extra_sp += 4;
                             let total_dims = 1 + dims.len();
                             for (i, idx) in indices.iter().enumerate() {
+                                if i > 0 { self.emit_push_t2(); }
                                 self.gen_expr(idx, frame)?;
+                                if i > 0 { self.emit_pop_t2(); }
                                 let stride: i32 = if i == 0 { dims.iter().product() } else { dims.iter().skip(i).product() };
                                 if stride != 1 { self.emit(&format!("li t1, {}", stride)); self.emit("mul a0, a0, t1"); }
                                 if i == 0 { self.emit("mv t2, a0"); } else { self.emit("add t2, t2, a0"); }
@@ -998,7 +1065,7 @@ impl RiscvGen {
                             self.emit("add t2, t5, t2");
                             if indices.len() >= total_dims { self.emit("lw a0, 0(t2)"); } else { self.emit("mv a0, t2"); }
                         }
-                        Some(RvSymbol::Global(label, dims)) if !dims.is_empty() => {
+                        Some(RvSymbol::Global(label, dims, _)) if !dims.is_empty() => {
                             let l = label.clone();
                             let arr_dims = dims.clone();
                             let total_dims = arr_dims.len();
@@ -1008,7 +1075,9 @@ impl RiscvGen {
                             self.emit("sw t3, 0(sp)");
                             self.extra_sp += 4;
                             for (i, idx) in indices.iter().enumerate() {
+                                if i > 0 { self.emit_push_t2(); }
                                 self.gen_expr(idx, frame)?;
+                                if i > 0 { self.emit_pop_t2(); }
                                 let stride: i32 = arr_dims.iter().skip(i + 1).product();
                                 if stride != 1 { self.emit(&format!("li t1, {}", stride)); self.emit("mul a0, a0, t1"); }
                                 if i == 0 { self.emit("mv t2, a0"); } else { self.emit("add t2, t2, a0"); }
