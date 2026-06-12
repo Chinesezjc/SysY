@@ -10,7 +10,9 @@ pub(crate) enum RvSymbol {
     Const(i32),
     Var { offset: i32 },
     Array { offset: i32, dims: Vec<i32> },
-    Global(String),
+    PtrArray { offset: i32 },
+    NdParam { offset: i32, dims: Vec<i32> },
+    Global(String, Vec<i32>),
 }
 
 pub(crate) struct RiscvGen {
@@ -97,6 +99,30 @@ impl RiscvGen {
         self.out.push('\n');
     }
 
+    /// Emit stack pointer adjustment handling large delta (>2047)
+    fn emit_sp_add(&mut self, delta: i32) {
+        if delta > 0 {
+            if delta < 2048 { self.emit(&format!("addi sp, sp, {delta}")); }
+            else { self.emit(&format!("li t0, {delta}")); self.emit("add sp, sp, t0"); }
+        } else if delta < 0 {
+            let abs_delta = -delta;
+            if abs_delta < 2048 { self.emit(&format!("addi sp, sp, -{abs_delta}")); }
+            else { self.emit(&format!("li t0, {abs_delta}")); self.emit("sub sp, sp, t0"); }
+        }
+    }
+
+    /// Emit load with large sp offset
+    fn emit_lw(&mut self, rd: &str, offset: i32) {
+        if offset >= -2048 && offset < 2048 { self.emit(&format!("lw {rd}, {offset}(sp)")); }
+        else { self.emit(&format!("li {rd}, {offset}")); self.emit(&format!("add {rd}, sp, {rd}")); self.emit(&format!("lw {rd}, 0({rd})")); }
+    }
+
+    /// Emit store with large sp offset
+    fn emit_sw(&mut self, rs: &str, offset: i32) {
+        if offset >= -2048 && offset < 2048 { self.emit(&format!("sw {rs}, {offset}(sp)")); }
+        else { self.emit(&format!("li t0, {offset}")); self.emit("add t0, sp, t0"); self.emit(&format!("sw {rs}, 0(t0)")); }
+    }
+
     pub(crate) fn gen_program(mut self, program: &CompUnit) -> CompilerResult<String> {
         // First pass: collect global declarations
         let mut const_vals: HashMap<String, i32> = HashMap::new();
@@ -105,9 +131,19 @@ impl RiscvGen {
                 match decl {
                     Decl::Const(defs) => {
                         for def in defs {
-                            let val = Self::collect_eval_const(&def.init, &const_vals);
-                            const_vals.insert(def.name.clone(), val);
-                            self.globals.insert(def.name.clone(), RvSymbol::Const(val));
+                            if def.dims.is_empty() && !matches!(&def.init, Expr::InitList(_)) {
+                                let val = Self::collect_eval_const(&def.init, &const_vals);
+                                const_vals.insert(def.name.clone(), val);
+                                self.globals.insert(def.name.clone(), RvSymbol::Const(val));
+                            } else {
+                                let label = def.name.clone();
+                                let dims: Vec<i32> = def.dims.iter()
+                                    .map(|d| Self::collect_eval_const(d, &const_vals))
+                                    .collect();
+                                let total: i32 = dims.iter().product();
+                                self.data_section.push_str(&format!("{}:\n  .zero {}\n", label, total * 4));
+                                self.globals.insert(label.clone(), RvSymbol::Global(label, dims));
+                            }
                         }
                     }
                     Decl::Var(defs) => {
@@ -118,14 +154,15 @@ impl RiscvGen {
                                     .map(|e| Self::collect_eval_const(e, &const_vals))
                                     .unwrap_or(0);
                                 self.data_section.push_str(&format!("{}:\n  .word {}\n", label, init_val));
+                                self.globals.insert(label.clone(), RvSymbol::Global(label, vec![]));
                             } else {
                                 let dims: Vec<i32> = def.dims.iter()
                                     .map(|d| Self::collect_eval_const(d, &const_vals))
                                     .collect();
                                 let total: i32 = dims.iter().product();
                                 self.data_section.push_str(&format!("{}:\n  .zero {}\n", label, total * 4));
+                                self.globals.insert(label.clone(), RvSymbol::Global(label, dims));
                             }
-                            self.globals.insert(label.clone(), RvSymbol::Global(label));
                         }
                     }
                 }
@@ -149,7 +186,6 @@ impl RiscvGen {
                     self.out.clear();
                     self.loop_stack.clear();
                     self.current_ret_type = func.ret_type;
-                    self.label = 0;
 
                     // First pass: collect variables
                     let mut slot = 0i32;
@@ -186,38 +222,43 @@ impl RiscvGen {
                     let total_frame = self.frame_size + 4; // +4 for ra
                     let aligned_frame = align16(total_frame);
                     let ra_offset = aligned_frame - 4;
-                    self.emit(&format!("addi sp, sp, -{}", aligned_frame));
-                    self.emit(&format!("sw ra, {ra_offset}(sp)"));
+                    self.emit_sp_add(-aligned_frame);
+                    self.emit_sw("ra", ra_offset);
 
                     // Store params into their stack slots
                     for (i, param) in func.params.iter().enumerate() {
                         let (_, offset) = self.next_mangled(&param.name);
-                        // Adjust offset: frame is now at sp + 4 (since we also pushed ra)
-                        // Actually the offsets were computed from 0, starting at sp
-                        // But we pushed ra above the vars, so we need to add 4 to each offset
                         let adjusted_offset = offset + 4;
                         let reg = match i {
-                            0 => "a0",
-                            1 => "a1",
-                            2 => "a2",
-                            3 => "a3",
-                            4 => "a4",
-                            5 => "a5",
-                            6 => "a6",
-                            7 => "a7",
+                            0 => "a0", 1 => "a1", 2 => "a2", 3 => "a3",
+                            4 => "a4", 5 => "a5", 6 => "a6", 7 => "a7",
                             _ => {
-                                // Stack args — load from caller's frame
-                                // For simplicity, skip >8 args
+                                // Stack args: load from caller's frame
+                                let stack_arg_offset = aligned_frame + (i - 8) as i32 * 4;
+                                self.emit_lw("t0", stack_arg_offset);
+                                self.emit_sw("t0", adjusted_offset);
+                                let sym = if param.is_array {
+                                    if param.array_dims.is_empty() { RvSymbol::PtrArray { offset: adjusted_offset } }
+                                    else { RvSymbol::NdParam { offset: adjusted_offset, dims: vec![] } }
+                                } else { RvSymbol::Var { offset: adjusted_offset } };
+                                self.scopes.last_mut().unwrap().insert(param.name.clone(), sym);
                                 continue;
                             }
                         };
-                        self.emit(&format!("sw {reg}, {adjusted_offset}(sp)"));
-                        self.scopes.last_mut().unwrap().insert(
-                            param.name.clone(),
-                            RvSymbol::Var {
-                                offset: adjusted_offset,
-                            },
-                        );
+                        self.emit_sw(reg, adjusted_offset);
+                        let sym = if param.is_array {
+                            if param.array_dims.is_empty() {
+                                RvSymbol::PtrArray { offset: adjusted_offset }
+                            } else {
+                                let fixed_dims: Vec<i32> = param.array_dims.iter()
+                                    .map(|d| Self::collect_eval_const(d, &HashMap::new()))
+                                    .collect();
+                                RvSymbol::NdParam { offset: adjusted_offset, dims: fixed_dims }
+                            }
+                        } else {
+                            RvSymbol::Var { offset: adjusted_offset }
+                        };
+                        self.scopes.last_mut().unwrap().insert(param.name.clone(), sym);
                     }
 
                     // Reset read_pos for local vars
@@ -225,6 +266,14 @@ impl RiscvGen {
                     // We don't reset — continue reading from the same position
 
                     self.gen_block(&func.body, aligned_frame)?;
+
+                    // Ensure void functions return
+                    if func.ret_type == Type::Void {
+                        let ra_offset = aligned_frame - 4;
+                        self.emit_lw("ra", ra_offset);
+                        self.emit_sp_add(aligned_frame);
+                        self.emit("ret");
+                    }
 
                     out.push_str(&self.out);
                 }
@@ -256,8 +305,20 @@ impl RiscvGen {
             match item {
                 BlockItem::Decl(Decl::Const(defs)) => {
                     for def in defs {
-                        let val = Self::collect_eval_const(&def.init, const_vals);
-                        const_vals.insert(def.name.clone(), val);
+                        if def.dims.is_empty() && !matches!(&def.init, Expr::InitList(_)) {
+                            let val = Self::collect_eval_const(&def.init, const_vals);
+                            const_vals.insert(def.name.clone(), val);
+                        } else {
+                            let count = name_count.entry(def.name.clone()).or_insert(0);
+                            let mangled = if *count == 0 { def.name.clone() } else { format!("{}_{}", def.name, count) };
+                            *count += 1;
+                            self.var_offsets.insert(mangled.clone(), *slot * 4);
+                            self.mangled_names.entry(def.name.clone()).or_default().push(mangled);
+                            let elems: i32 = def.dims.iter()
+                                .map(|d| Self::collect_eval_const(d, const_vals))
+                                .product();
+                            *slot += if elems > 0 { elems } else { 1 };
+                        }
                     }
                 }
                 BlockItem::Decl(Decl::Var(defs)) => {
@@ -335,11 +396,20 @@ impl RiscvGen {
                             def.name
                         )));
                     }
-                    let val = self.eval_const(&def.init)?;
-                    self.scopes
-                        .last_mut()
-                        .unwrap()
-                        .insert(def.name.clone(), RvSymbol::Const(val));
+                    if def.dims.is_empty() && !matches!(&def.init, Expr::InitList(_)) {
+                        let val = self.eval_const(&def.init)?;
+                        self.scopes.last_mut().unwrap().insert(def.name.clone(), RvSymbol::Const(val));
+                    } else {
+                        let (_, offset) = self.next_mangled(&def.name);
+                        let adjusted_offset = offset + 4;
+                        let dims: Vec<i32> = def.dims.iter()
+                            .map(|d| self.eval_const(d))
+                            .collect::<CompilerResult<_>>()?;
+                        self.scopes.last_mut().unwrap().insert(
+                            def.name.clone(),
+                            RvSymbol::Array { offset: adjusted_offset, dims },
+                        );
+                    }
                 }
             }
             Decl::Var(defs) => {
@@ -355,7 +425,7 @@ impl RiscvGen {
                     if def.dims.is_empty() {
                         if let Some(init) = &def.init {
                             self.gen_expr(init, frame)?;
-                            self.emit(&format!("sw a0, {adjusted_offset}(sp)"));
+                            self.emit_sw("a0", adjusted_offset);
                         }
                         self.scopes.last_mut().unwrap().insert(
                             def.name.clone(),
@@ -389,8 +459,8 @@ impl RiscvGen {
                 }
                 // Epilogue
                 let ra_offset = frame - 4;
-                self.emit(&format!("lw ra, {ra_offset}(sp)"));
-                self.emit(&format!("addi sp, sp, {frame}"));
+                self.emit_lw("ra", ra_offset);
+                self.emit_sp_add(frame);
                 self.emit("ret");
             }
             Stmt::Assign { name, index, expr } => {
@@ -399,9 +469,9 @@ impl RiscvGen {
                         Some(RvSymbol::Var { offset }) => {
                             let off = *offset;
                             self.gen_expr(expr, frame)?;
-                            self.emit(&format!("sw a0, {off}(sp)"));
+                            self.emit_sw("a0", off);
                         }
-                        Some(RvSymbol::Global(label)) => {
+                        Some(RvSymbol::Global(label, _)) => {
                             let l = label.clone();
                             self.gen_expr(expr, frame)?;
                             self.emit("mv t0, a0");
@@ -425,35 +495,76 @@ impl RiscvGen {
                         }
                     };
                 } else {
-                    let (arr_offset, arr_dims) = match self.lookup(name) {
-                        Some(RvSymbol::Array { offset, dims }) => (*offset, dims.clone()),
+                    let sym = self.lookup(name).cloned();
+                    match sym {
+                        Some(RvSymbol::Array { offset, dims }) => {
+                            let arr_offset = offset;
+                            let arr_dims = dims.clone();
+                            self.gen_expr(expr, frame)?;
+                            self.emit("mv t1, a0");
+                            for (i, idx) in index.iter().enumerate() {
+                                self.gen_expr(idx, frame)?;
+                                let stride: i32 = arr_dims.iter().skip(i + 1).product();
+                                if stride != 1 { self.emit(&format!("li t0, {}", stride)); self.emit("mul a0, a0, t0"); }
+                                if i == 0 { self.emit("mv t2, a0"); } else { self.emit("add t2, t2, a0"); }
+                            }
+                            self.emit("slli t2, t2, 2");
+                            self.emit(&format!("addi t2, t2, {}", arr_offset + self.extra_sp));
+                            self.emit("add t2, sp, t2");
+                            self.emit("sw t1, 0(t2)");
+                        }
+                        Some(RvSymbol::PtrArray { offset }) => {
+                            let addr = offset + self.extra_sp;
+                            self.emit_lw("t3", addr);
+                            self.gen_expr(expr, frame)?;
+                            self.emit("mv t1, a0");
+                            for (i, idx) in index.iter().enumerate() {
+                                self.gen_expr(idx, frame)?;
+                                self.emit("slli a0, a0, 2");
+                                if i == 0 { self.emit("mv t2, a0"); } else { self.emit("add t2, t2, a0"); }
+                            }
+                            self.emit("add t2, t3, t2");
+                            self.emit("sw t1, 0(t2)");
+                        }
+                        Some(RvSymbol::NdParam { offset, dims }) => {
+                            let addr = offset + self.extra_sp;
+                            self.emit_lw("t3", addr);
+                            self.gen_expr(expr, frame)?;
+                            self.emit("mv t1, a0");
+                            let total_dims = 1 + dims.len();
+                            for (i, idx) in index.iter().enumerate() {
+                                self.gen_expr(idx, frame)?;
+                                let fixed_idx = if i == 0 { 0 } else { i - 1 };
+                                let stride: i32 = dims.iter().skip(fixed_idx + 1).product();
+                                if stride != 1 { self.emit(&format!("li t0, {}", stride)); self.emit("mul a0, a0, t0"); }
+                                if i == 0 { self.emit("mv t2, a0"); } else { self.emit("add t2, t2, a0"); }
+                            }
+                            self.emit("slli t2, t2, 2");
+                            self.emit("add t2, t3, t2");
+                            self.emit("sw t1, 0(t2)");
+                        }
+                        Some(RvSymbol::Global(label, dims)) if !dims.is_empty() => {
+                            let l = label.clone();
+                            let arr_dims = dims.clone();
+                            self.emit(&format!("la t3, {l}"));
+                            self.gen_expr(expr, frame)?;
+                            self.emit("mv t1, a0");
+                            for (i, idx) in index.iter().enumerate() {
+                                self.gen_expr(idx, frame)?;
+                                let stride: i32 = arr_dims.iter().skip(i + 1).product();
+                                if stride != 1 { self.emit(&format!("li t0, {}", stride)); self.emit("mul a0, a0, t0"); }
+                                if i == 0 { self.emit("mv t2, a0"); } else { self.emit("add t2, t2, a0"); }
+                            }
+                            self.emit("slli t2, t2, 2");
+                            self.emit("add t2, t3, t2");
+                            self.emit("sw t1, 0(t2)");
+                        }
                         _ => {
                             return Err(CompilerError::new(format!(
                                 "'{name}' is not an array"
                             )));
                         }
-                    };
-                    // Evaluate RHS first, save to t1
-                    self.gen_expr(expr, frame)?;
-                    self.emit("mv t1, a0");
-                    // Compute flat element index: sum(index_i * stride_i)
-                    for (i, idx) in index.iter().enumerate() {
-                        self.gen_expr(idx, frame)?; // a0 = index value
-                        let stride: i32 = arr_dims.iter().skip(i + 1).product();
-                        if stride != 1 {
-                            self.emit(&format!("li t0, {}", stride));
-                            self.emit("mul a0, a0, t0");
-                        }
-                        if i == 0 {
-                            self.emit("mv t2, a0");
-                        } else {
-                            self.emit("add t2, t2, a0");
-                        }
                     }
-                    self.emit("slli t2, t2, 2");
-                    self.emit(&format!("addi t2, t2, {}", arr_offset + self.extra_sp));
-                    self.emit("add t2, sp, t2");
-                    self.emit("sw t1, 0(t2)");
                 }
             }
             Stmt::Expr(expr) => {
@@ -582,26 +693,39 @@ impl RiscvGen {
             Expr::Int(n) => {
                 self.emit(&format!("li a0, {n}"));
             }
-            Expr::LVal(name) => match self.lookup(name) {
+            Expr::LVal(name) => {
+                let sym = self.lookup(name).cloned();
+                match sym {
                 Some(RvSymbol::Const(v)) => {
                     self.emit(&format!("li a0, {v}"));
                 }
                 Some(RvSymbol::Var { offset }) => {
-                    let addr = *offset + self.extra_sp;
-                    self.emit(&format!("lw a0, {addr}(sp)"));
+                    let addr = offset + self.extra_sp;
+                    self.emit_lw("a0", addr);
                 }
                 Some(RvSymbol::Array { offset, .. }) => {
                     self.emit(&format!("addi a0, sp, {}", offset + self.extra_sp));
                 }
-                Some(RvSymbol::Global(label)) => {
+                Some(RvSymbol::PtrArray { offset }) => {
+                    let addr = offset + self.extra_sp;
+                    self.emit_lw("a0", addr);
+                }
+                Some(RvSymbol::NdParam { offset, .. }) => {
+                    let addr = offset + self.extra_sp;
+                    self.emit_lw("a0", addr);
+                }
+                Some(RvSymbol::Global(label, dims)) => {
                     let l = label.clone();
                     self.emit(&format!("la a0, {l}"));
-                    self.emit("lw a0, 0(a0)");
+                    if dims.is_empty() {
+                        self.emit("lw a0, 0(a0)");
+                    }
                 }
                 None => {
                     return Err(CompilerError::new(format!(
                         "undefined identifier '{name}'"
                     )));
+                }
                 }
             },
             Expr::Unary { op, expr } => {
@@ -692,7 +816,6 @@ impl RiscvGen {
                 }
             },
             Expr::Index { array, index } => {
-                // Walk the Index chain to find base LVal
                 let mut indices: Vec<&Expr> = vec![index.as_ref()];
                 let mut base: &Expr = array.as_ref();
                 while let Expr::Index { array: inner_arr, index: inner_idx } = base {
@@ -701,28 +824,64 @@ impl RiscvGen {
                 }
                 indices.reverse();
                 if let Expr::LVal(name) = base {
-                    let (arr_offset, arr_dims) = match self.lookup(name) {
-                        Some(RvSymbol::Array { offset, dims }) => (*offset, dims.clone()),
+                    let sym = self.lookup(name).cloned();
+                    match sym {
+                        Some(RvSymbol::Array { offset, dims }) => {
+                            let arr_offset = offset;
+                            let arr_dims = dims.clone();
+                            for (i, idx) in indices.iter().enumerate() {
+                                self.gen_expr(idx, frame)?;
+                                let stride: i32 = arr_dims.iter().skip(i + 1).product();
+                                if stride != 1 { self.emit(&format!("li t1, {}", stride)); self.emit("mul a0, a0, t1"); }
+                                if i == 0 { self.emit("mv t2, a0"); } else { self.emit("add t2, t2, a0"); }
+                            }
+                            self.emit("slli t2, t2, 2");
+                            self.emit(&format!("addi t2, t2, {}", arr_offset + self.extra_sp));
+                            self.emit("add t2, sp, t2");
+                            self.emit("lw a0, 0(t2)");
+                        }
+                        Some(RvSymbol::PtrArray { offset }) => {
+                            let addr = offset + self.extra_sp;
+                            self.emit_lw("t3", addr);
+                            for (i, idx) in indices.iter().enumerate() {
+                                self.gen_expr(idx, frame)?;
+                                self.emit("slli a0, a0, 2");
+                                if i == 0 { self.emit("mv t2, a0"); } else { self.emit("add t2, t2, a0"); }
+                            }
+                            self.emit("add t2, t3, t2");
+                            self.emit("lw a0, 0(t2)");
+                        }
+                        Some(RvSymbol::NdParam { offset, dims }) => {
+                            let addr = offset + self.extra_sp;
+                            self.emit_lw("t3", addr);
+                            let total_dims = 1 + dims.len();
+                            for (i, idx) in indices.iter().enumerate() {
+                                self.gen_expr(idx, frame)?;
+                                let fixed_idx = if i == 0 { 0 } else { i - 1 };
+                                let stride: i32 = dims.iter().skip(fixed_idx + 1).product();
+                                if stride != 1 { self.emit(&format!("li t1, {}", stride)); self.emit("mul a0, a0, t1"); }
+                                if i == 0 { self.emit("mv t2, a0"); } else { self.emit("add t2, t2, a0"); }
+                            }
+                            self.emit("slli t2, t2, 2");
+                            self.emit("add t2, t3, t2");
+                            self.emit("lw a0, 0(t2)");
+                        }
+                        Some(RvSymbol::Global(label, dims)) if !dims.is_empty() => {
+                            let l = label.clone();
+                            let arr_dims = dims.clone();
+                            self.emit(&format!("la t3, {l}"));
+                            for (i, idx) in indices.iter().enumerate() {
+                                self.gen_expr(idx, frame)?;
+                                let stride: i32 = arr_dims.iter().skip(i + 1).product();
+                                if stride != 1 { self.emit(&format!("li t1, {}", stride)); self.emit("mul a0, a0, t1"); }
+                                if i == 0 { self.emit("mv t2, a0"); } else { self.emit("add t2, t2, a0"); }
+                            }
+                            self.emit("slli t2, t2, 2");
+                            self.emit("add t2, t3, t2");
+                            self.emit("lw a0, 0(t2)");
+                        }
                         _ => return Err(CompilerError::new(format!("'{name}' is not an array"))),
-                    };
-                    // Compute flat element index: sum(index_i * stride_i)
-                    for (i, idx) in indices.iter().enumerate() {
-                        self.gen_expr(idx, frame)?; // a0 = index value
-                        let stride: i32 = arr_dims.iter().skip(i + 1).product();
-                        if stride != 1 {
-                            self.emit(&format!("li t1, {}", stride));
-                            self.emit("mul a0, a0, t1");
-                        }
-                        if i == 0 {
-                            self.emit("mv t2, a0");
-                        } else {
-                            self.emit("add t2, t2, a0");
-                        }
                     }
-                    self.emit("slli t2, t2, 2");
-                    self.emit(&format!("addi t2, t2, {}", arr_offset + self.extra_sp));
-                    self.emit("add t2, sp, t2");
-                    self.emit("lw a0, 0(t2)");
                 } else {
                     return Err(CompilerError::new("invalid array access"));
                 }
