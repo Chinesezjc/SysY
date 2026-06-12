@@ -622,11 +622,9 @@ impl RiscvGen {
                             self.emit_lw("t3", addr);
                             self.gen_expr(expr, frame)?;
                             self.emit("mv t1, a0");
-                            let total_dims = 1 + dims.len();
                             for (i, idx) in index.iter().enumerate() {
                                 self.gen_expr(idx, frame)?;
-                                let fixed_idx = if i == 0 { 0 } else { i - 1 };
-                                let stride: i32 = dims.iter().skip(fixed_idx + 1).product();
+                                let stride: i32 = if i == 0 { dims.iter().product() } else { dims.iter().skip(i).product() };
                                 if stride != 1 { self.emit(&format!("li t0, {}", stride)); self.emit("mul a0, a0, t0"); }
                                 if i == 0 { self.emit("mv t2, a0"); } else { self.emit("add t2, t2, a0"); }
                             }
@@ -903,6 +901,7 @@ impl RiscvGen {
                         Some(RvSymbol::Array { offset, dims }) => {
                             let arr_offset = offset;
                             let arr_dims = dims.clone();
+                            let total_dims = arr_dims.len();
                             for (i, idx) in indices.iter().enumerate() {
                                 self.gen_expr(idx, frame)?;
                                 let stride: i32 = arr_dims.iter().skip(i + 1).product();
@@ -912,7 +911,7 @@ impl RiscvGen {
                             self.emit("slli t2, t2, 2");
                             self.emit(&format!("addi t2, t2, {}", arr_offset + self.extra_sp));
                             self.emit("add t2, sp, t2");
-                            self.emit("lw a0, 0(t2)");
+                            if indices.len() >= total_dims { self.emit("lw a0, 0(t2)"); } else { self.emit("mv a0, t2"); }
                         }
                         Some(RvSymbol::PtrArray { offset }) => {
                             let addr = offset + self.extra_sp;
@@ -931,18 +930,18 @@ impl RiscvGen {
                             let total_dims = 1 + dims.len();
                             for (i, idx) in indices.iter().enumerate() {
                                 self.gen_expr(idx, frame)?;
-                                let fixed_idx = if i == 0 { 0 } else { i - 1 };
-                                let stride: i32 = dims.iter().skip(fixed_idx + 1).product();
+                                let stride: i32 = if i == 0 { dims.iter().product() } else { dims.iter().skip(i).product() };
                                 if stride != 1 { self.emit(&format!("li t1, {}", stride)); self.emit("mul a0, a0, t1"); }
                                 if i == 0 { self.emit("mv t2, a0"); } else { self.emit("add t2, t2, a0"); }
                             }
                             self.emit("slli t2, t2, 2");
                             self.emit("add t2, t3, t2");
-                            self.emit("lw a0, 0(t2)");
+                            if indices.len() >= total_dims { self.emit("lw a0, 0(t2)"); } else { self.emit("mv a0, t2"); }
                         }
                         Some(RvSymbol::Global(label, dims)) if !dims.is_empty() => {
                             let l = label.clone();
                             let arr_dims = dims.clone();
+                            let total_dims = arr_dims.len();
                             self.emit(&format!("la t3, {l}"));
                             for (i, idx) in indices.iter().enumerate() {
                                 self.gen_expr(idx, frame)?;
@@ -952,7 +951,7 @@ impl RiscvGen {
                             }
                             self.emit("slli t2, t2, 2");
                             self.emit("add t2, t3, t2");
-                            self.emit("lw a0, 0(t2)");
+                            if indices.len() >= total_dims { self.emit("lw a0, 0(t2)"); } else { self.emit("mv a0, t2"); }
                         }
                         _ => return Err(CompilerError::new(format!("'{name}' is not an array"))),
                     }
