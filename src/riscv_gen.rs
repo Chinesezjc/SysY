@@ -144,10 +144,12 @@ impl RiscvGen {
                                 self.data_section.push_str(&format!("{}:\n", label));
                                 let mut vals = Vec::new();
                                 Self::flatten_init_vals(&dims, &def.init, &mut vals);
+                                let total_usize = total as usize;
+                                if vals.len() > total_usize { vals.truncate(total_usize); }
                                 for v in &vals {
                                     self.data_section.push_str(&format!("  .word {}\n", v));
                                 }
-                                let remaining = total as usize - vals.len();
+                                let remaining = total_usize.saturating_sub(vals.len());
                                 if remaining > 0 {
                                     self.data_section.push_str(&format!("  .zero {}\n", remaining * 4));
                                 }
@@ -174,10 +176,12 @@ impl RiscvGen {
                                 if let Some(init) = &def.init {
                                     let mut vals = Vec::new();
                                     Self::flatten_init_vals(dims.as_slice(), init, &mut vals);
+                                    let total_usize = total as usize;
+                                    if vals.len() > total_usize { vals.truncate(total_usize); }
                                     for v in &vals {
                                         self.data_section.push_str(&format!("  .word {}\n", v));
                                     }
-                                    let remaining = total as usize - vals.len();
+                                    let remaining = total_usize.saturating_sub(vals.len());
                                     if remaining > 0 {
                                         self.data_section.push_str(&format!("  .zero {}\n", remaining * 4));
                                     }
@@ -307,6 +311,7 @@ impl RiscvGen {
     }
 
     fn flatten_init_vals(dims: &[i32], init: &Expr, vals: &mut Vec<i32>) {
+        let total: usize = dims.iter().map(|&d| d as usize).product();
         match init {
             Expr::InitList(items) => {
                 if items.is_empty() { return; }
@@ -321,20 +326,26 @@ impl RiscvGen {
                     }
                 } else {
                     let sub_dims = &dims[1..];
-                    let sub_size: i32 = sub_dims.iter().product();
+                    let sub_size: usize = sub_dims.iter().map(|&d| d as usize).product();
                     for item in items {
                         let before = vals.len();
                         match item {
                             Expr::InitList(_) => Self::flatten_init_vals(sub_dims, item, vals),
-                            _ => { vals.push(0); }
+                            e => {
+                                vals.push(0); // placeholder - will be overwritten by padding
+                                // Actually, push the scalar as first element of sub-array
+                                let pos = vals.len() - 1;
+                                if let Expr::Int(n) = e { vals[pos] = *n; }
+                            }
                         }
                         let after = vals.len();
-                        let remainder = (sub_size as usize - (after - before) % sub_size as usize) % sub_size as usize;
+                        let remainder = (sub_size - (after - before) % sub_size) % sub_size;
                         for _ in 0..remainder { vals.push(0); }
                     }
                 }
+                while vals.len() < total { vals.push(0); }
             }
-            Expr::Int(n) => vals.push(*n),
+            Expr::Int(n) => { vals.push(*n); while vals.len() < total { vals.push(0); } }
             _ => {}
         }
     }
@@ -509,6 +520,8 @@ impl RiscvGen {
                         if let Some(init) = &def.init {
                             let mut vals = Vec::new();
                             Self::flatten_init_vals(&dims, init, &mut vals);
+                            let total_usize: usize = dims.iter().map(|&d| d as usize).product();
+                            if vals.len() > total_usize { vals.truncate(total_usize); }
                             for (i, v) in vals.iter().enumerate() {
                                 self.emit(&format!("li t0, {}", v));
                                 let offset = adjusted_offset + i as i32 * 4;
