@@ -295,9 +295,10 @@ impl<'a> Lexer<'a> {
             return Ok(TokenKind::IntLiteral(0));
         }
 
-        let value = i32::from_str_radix(digits, radix)
+        // Use u32 to allow hex literals like 0x80000000 (bit pattern for INT32_MIN)
+        let value = u32::from_str_radix(digits, radix)
             .map_err(|_| CompilerError::at(position, "integer literal out of range"))?;
-        Ok(TokenKind::IntLiteral(value))
+        Ok(TokenKind::IntLiteral(value as i32))
     }
 
     fn peek(&self) -> Option<u8> {

@@ -114,13 +114,24 @@ impl RiscvGen {
     /// Emit load with large sp offset
     fn emit_lw(&mut self, rd: &str, offset: i32) {
         if offset >= -2048 && offset < 2048 { self.emit(&format!("lw {rd}, {offset}(sp)")); }
-        else { self.emit(&format!("li {rd}, {offset}")); self.emit(&format!("add {rd}, sp, {rd}")); self.emit(&format!("lw {rd}, 0({rd})")); }
+        else {
+            // Use a scratch register to compute the address, then load into rd
+            self.emit(&format!("li t0, {offset}"));
+            self.emit("add t0, sp, t0");
+            self.emit(&format!("lw {rd}, 0(t0)"));
+        }
     }
 
     /// Emit store with large sp offset
     fn emit_sw(&mut self, rs: &str, offset: i32) {
         if offset >= -2048 && offset < 2048 { self.emit(&format!("sw {rs}, {offset}(sp)")); }
-        else { self.emit(&format!("li t0, {offset}")); self.emit("add t0, sp, t0"); self.emit(&format!("sw {rs}, 0(t0)")); }
+        else {
+            // Use a scratch register that differs from rs to avoid clobbering the value
+            let scratch = if rs == "t0" { "t1" } else { "t0" };
+            self.emit(&format!("li {scratch}, {offset}"));
+            self.emit(&format!("add {scratch}, sp, {scratch}"));
+            self.emit(&format!("sw {rs}, 0({scratch})"));
+        }
     }
 
     /// Emit addi with potentially large immediate (uses t0 as scratch)
