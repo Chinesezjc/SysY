@@ -266,7 +266,12 @@ impl RiscvGen {
                                 self.emit_sw("t0", adjusted_offset);
                                 let sym = if param.is_array {
                                     if param.array_dims.is_empty() { RvSymbol::PtrArray { offset: adjusted_offset } }
-                                    else { RvSymbol::NdParam { offset: adjusted_offset, dims: vec![] } }
+                                    else {
+                                        let fixed_dims: Vec<i32> = param.array_dims.iter()
+                                            .map(|d| Self::collect_eval_const(d, &HashMap::new()))
+                                            .collect();
+                                        RvSymbol::NdParam { offset: adjusted_offset, dims: fixed_dims }
+                                    }
                                 } else { RvSymbol::Var { offset: adjusted_offset } };
                                 self.scopes.last_mut().unwrap().insert(param.name.clone(), sym);
                                 continue;
@@ -607,8 +612,11 @@ impl RiscvGen {
                         Some(RvSymbol::PtrArray { offset }) => {
                             let addr = offset + self.extra_sp;
                             self.emit_lw("t3", addr);
+                            // Save base pointer to t4 before evaluating RHS (gen_expr may clobber t3)
+                            self.emit("mv t4, t3");
                             self.gen_expr(expr, frame)?;
                             self.emit("mv t1, a0");
+                            self.emit("mv t3, t4");  // restore base pointer
                             for (i, idx) in index.iter().enumerate() {
                                 self.gen_expr(idx, frame)?;
                                 self.emit("slli a0, a0, 2");
@@ -620,8 +628,11 @@ impl RiscvGen {
                         Some(RvSymbol::NdParam { offset, dims }) => {
                             let addr = offset + self.extra_sp;
                             self.emit_lw("t3", addr);
+                            // Save base pointer to t4 before evaluating RHS
+                            self.emit("mv t4, t3");
                             self.gen_expr(expr, frame)?;
                             self.emit("mv t1, a0");
+                            self.emit("mv t3, t4");  // restore base pointer
                             for (i, idx) in index.iter().enumerate() {
                                 self.gen_expr(idx, frame)?;
                                 let stride: i32 = if i == 0 { dims.iter().product() } else { dims.iter().skip(i).product() };
@@ -965,16 +976,16 @@ impl RiscvGen {
                 ));
             }
             Expr::Call { name, args } => {
-                // Push all args onto stack (reversed order for RISC-V calling convention)
-                for (_i, arg) in args.iter().enumerate() {
+                // Push args in reverse order so that after popping, a0 gets arg0, a1 gets arg1, etc.
+                for (_i, arg) in args.iter().enumerate().rev() {
                     self.gen_expr(arg, frame)?;
                     self.emit("addi sp, sp, -4");
                     self.emit("sw a0, 0(sp)");
                     self.extra_sp += 4;
                 }
-                // Pop into registers (a0-a7), leave extra args on stack
+                // Pop into registers: last pushed = arg0 → a0, arg1 → a1, ..., arg7 → a7
                 let reg_count = args.len().min(8);
-                for i in (0..reg_count).rev() {
+                for i in 0..reg_count {
                     let reg = match i {
                         0 => "a0", 1 => "a1", 2 => "a2", 3 => "a3",
                         4 => "a4", 5 => "a5", 6 => "a6", 7 => "a7",
