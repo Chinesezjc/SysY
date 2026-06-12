@@ -125,25 +125,25 @@ impl RiscvGen {
 
     pub(crate) fn gen_program(mut self, program: &CompUnit) -> CompilerResult<String> {
         // First pass: collect global declarations
-        let mut const_vals: HashMap<String, i32> = HashMap::new();
+        let mut global_const_vals: HashMap<String, i32> = HashMap::new();
         for item in &program.items {
             if let GlobalItem::Decl(decl) = item {
                 match decl {
                     Decl::Const(defs) => {
                         for def in defs {
                             if def.dims.is_empty() && !matches!(&def.init, Expr::InitList(_)) {
-                                let val = Self::collect_eval_const(&def.init, &const_vals);
-                                const_vals.insert(def.name.clone(), val);
+                                let val = Self::collect_eval_const(&def.init, &global_const_vals);
+                                global_const_vals.insert(def.name.clone(), val);
                                 self.globals.insert(def.name.clone(), RvSymbol::Const(val));
                             } else {
                                 let label = def.name.clone();
                                 let dims: Vec<i32> = def.dims.iter()
-                                    .map(|d| Self::collect_eval_const(d, &const_vals))
+                                    .map(|d| Self::collect_eval_const(d, &global_const_vals))
                                     .collect();
                                 let total: i32 = dims.iter().product();
                                 self.data_section.push_str(&format!("{}:\n", label));
                                 let mut vals = Vec::new();
-                                Self::flatten_init_vals(&dims, &def.init, &mut vals);
+                                self.flatten_init_vals(&dims, &def.init, &mut vals);
                                 let total_usize = total as usize;
                                 if vals.len() > total_usize { vals.truncate(total_usize); }
                                 for v in &vals {
@@ -162,20 +162,20 @@ impl RiscvGen {
                             let label = def.name.clone();
                             if def.dims.is_empty() {
                                 let init_val = def.init.as_ref()
-                                    .map(|e| Self::collect_eval_const(e, &const_vals))
+                                    .map(|e| Self::collect_eval_const(e, &global_const_vals))
                                     .unwrap_or(0);
                                 self.data_section.push_str(&format!("{}:\n  .word {}\n", label, init_val));
                                 self.globals.insert(label.clone(), RvSymbol::Global(label, vec![]));
                             } else {
                                 let dims: Vec<i32> = def.dims.iter()
-                                    .map(|d| Self::collect_eval_const(d, &const_vals))
+                                    .map(|d| Self::collect_eval_const(d, &global_const_vals))
                                     .collect();
                                 let total: i32 = dims.iter().product();
                                 self.data_section.push_str(&format!("{}:\n", label));
                                 // Emit initializer values or zeros
                                 if let Some(init) = &def.init {
                                     let mut vals = Vec::new();
-                                    Self::flatten_init_vals(dims.as_slice(), init, &mut vals);
+                                    self.flatten_init_vals(dims.as_slice(), init, &mut vals);
                                     let total_usize = total as usize;
                                     if vals.len() > total_usize { vals.truncate(total_usize); }
                                     for v in &vals {
@@ -268,7 +268,7 @@ impl RiscvGen {
                                     if param.array_dims.is_empty() { RvSymbol::PtrArray { offset: adjusted_offset } }
                                     else {
                                         let fixed_dims: Vec<i32> = param.array_dims.iter()
-                                            .map(|d| Self::collect_eval_const(d, &HashMap::new()))
+                                            .map(|d| Self::collect_eval_const(d, &global_const_vals))
                                             .collect();
                                         RvSymbol::NdParam { offset: adjusted_offset, dims: fixed_dims }
                                     }
@@ -283,7 +283,7 @@ impl RiscvGen {
                                 RvSymbol::PtrArray { offset: adjusted_offset }
                             } else {
                                 let fixed_dims: Vec<i32> = param.array_dims.iter()
-                                    .map(|d| Self::collect_eval_const(d, &HashMap::new()))
+                                    .map(|d| Self::collect_eval_const(d, &global_const_vals))
                                     .collect();
                                 RvSymbol::NdParam { offset: adjusted_offset, dims: fixed_dims }
                             }
@@ -315,7 +315,7 @@ impl RiscvGen {
         Ok(out)
     }
 
-    fn flatten_init_vals(dims: &[i32], init: &Expr, vals: &mut Vec<i32>) {
+    fn flatten_init_vals(&self, dims: &[i32], init: &Expr, vals: &mut Vec<i32>) {
         let total: usize = dims.iter().map(|&d| d as usize).product();
         match init {
             Expr::InitList(items) => {
@@ -324,9 +324,9 @@ impl RiscvGen {
                 if dims.len() <= 1 || !has_nested {
                     for item in items {
                         match item {
-                            Expr::InitList(_) => Self::flatten_init_vals(&[], item, vals),
+                            Expr::InitList(_) => self.flatten_init_vals(&[], item, vals),
                             Expr::Int(n) => vals.push(*n),
-                            _ => vals.push(0),
+                            e => vals.push(self.eval_const(e).unwrap_or(0)),
                         }
                     }
                 } else {
@@ -335,12 +335,10 @@ impl RiscvGen {
                     for item in items {
                         let before = vals.len();
                         match item {
-                            Expr::InitList(_) => Self::flatten_init_vals(sub_dims, item, vals),
+                            Expr::InitList(_) => self.flatten_init_vals(sub_dims, item, vals),
                             e => {
-                                vals.push(0); // placeholder - will be overwritten by padding
-                                // Actually, push the scalar as first element of sub-array
-                                let pos = vals.len() - 1;
-                                if let Expr::Int(n) = e { vals[pos] = *n; }
+                                let val = self.eval_const(e).unwrap_or(0);
+                                vals.push(val);
                             }
                         }
                         let after = vals.len();
@@ -489,6 +487,18 @@ impl RiscvGen {
                         let dims: Vec<i32> = def.dims.iter()
                             .map(|d| self.eval_const(d))
                             .collect::<CompilerResult<_>>()?;
+                        // Emit init values for const arrays
+                        {
+                            let mut vals = Vec::new();
+                            self.flatten_init_vals(&dims, &def.init, &mut vals);
+                            let total_usize: usize = dims.iter().map(|&d| d as usize).product();
+                            if vals.len() > total_usize { vals.truncate(total_usize); }
+                            for (i, v) in vals.iter().enumerate() {
+                                self.emit(&format!("li t0, {}", v));
+                                let off = adjusted_offset + i as i32 * 4;
+                                self.emit_sw("t0", off);
+                            }
+                        }
                         self.scopes.last_mut().unwrap().insert(
                             def.name.clone(),
                             RvSymbol::Array { offset: adjusted_offset, dims },
@@ -524,7 +534,7 @@ impl RiscvGen {
                         // Emit init values if present
                         if let Some(init) = &def.init {
                             let mut vals = Vec::new();
-                            Self::flatten_init_vals(&dims, init, &mut vals);
+                            self.flatten_init_vals(&dims, init, &mut vals);
                             let total_usize: usize = dims.iter().map(|&d| d as usize).product();
                             if vals.len() > total_usize { vals.truncate(total_usize); }
                             for (i, v) in vals.iter().enumerate() {
@@ -612,27 +622,33 @@ impl RiscvGen {
                         Some(RvSymbol::PtrArray { offset }) => {
                             let addr = offset + self.extra_sp;
                             self.emit_lw("t3", addr);
-                            // Save base pointer to t4 before evaluating RHS (gen_expr may clobber t3)
-                            self.emit("mv t4, t3");
+                            // Push base to stack (handles arbitrary nesting)
+                            self.emit("addi sp, sp, -4");
+                            self.emit("sw t3, 0(sp)");
+                            self.extra_sp += 4;
                             self.gen_expr(expr, frame)?;
                             self.emit("mv t1, a0");
-                            self.emit("mv t3, t4");  // restore base pointer
                             for (i, idx) in index.iter().enumerate() {
                                 self.gen_expr(idx, frame)?;
                                 self.emit("slli a0, a0, 2");
                                 if i == 0 { self.emit("mv t2, a0"); } else { self.emit("add t2, t2, a0"); }
                             }
-                            self.emit("add t2, t3, t2");
+                            // Pop base from stack
+                            self.emit("lw t4, 0(sp)");
+                            self.emit("addi sp, sp, 4");
+                            self.extra_sp -= 4;
+                            self.emit("add t2, t4, t2");
                             self.emit("sw t1, 0(t2)");
                         }
                         Some(RvSymbol::NdParam { offset, dims }) => {
                             let addr = offset + self.extra_sp;
                             self.emit_lw("t3", addr);
-                            // Save base pointer to t4 before evaluating RHS
-                            self.emit("mv t4, t3");
+                            // Push base to stack (handles arbitrary nesting)
+                            self.emit("addi sp, sp, -4");
+                            self.emit("sw t3, 0(sp)");
+                            self.extra_sp += 4;
                             self.gen_expr(expr, frame)?;
                             self.emit("mv t1, a0");
-                            self.emit("mv t3, t4");  // restore base pointer
                             for (i, idx) in index.iter().enumerate() {
                                 self.gen_expr(idx, frame)?;
                                 let stride: i32 = if i == 0 { dims.iter().product() } else { dims.iter().skip(i).product() };
@@ -640,13 +656,21 @@ impl RiscvGen {
                                 if i == 0 { self.emit("mv t2, a0"); } else { self.emit("add t2, t2, a0"); }
                             }
                             self.emit("slli t2, t2, 2");
-                            self.emit("add t2, t3, t2");
+                            // Pop base from stack
+                            self.emit("lw t4, 0(sp)");
+                            self.emit("addi sp, sp, 4");
+                            self.extra_sp -= 4;
+                            self.emit("add t2, t4, t2");
                             self.emit("sw t1, 0(t2)");
                         }
                         Some(RvSymbol::Global(label, dims)) if !dims.is_empty() => {
                             let l = label.clone();
                             let arr_dims = dims.clone();
                             self.emit(&format!("la t3, {l}"));
+                            // Push base to stack (handles arbitrary nesting)
+                            self.emit("addi sp, sp, -4");
+                            self.emit("sw t3, 0(sp)");
+                            self.extra_sp += 4;
                             self.gen_expr(expr, frame)?;
                             self.emit("mv t1, a0");
                             for (i, idx) in index.iter().enumerate() {
@@ -656,7 +680,11 @@ impl RiscvGen {
                                 if i == 0 { self.emit("mv t2, a0"); } else { self.emit("add t2, t2, a0"); }
                             }
                             self.emit("slli t2, t2, 2");
-                            self.emit("add t2, t3, t2");
+                            // Pop base from stack
+                            self.emit("lw t4, 0(sp)");
+                            self.emit("addi sp, sp, 4");
+                            self.extra_sp -= 4;
+                            self.emit("add t2, t4, t2");
                             self.emit("sw t1, 0(t2)");
                         }
                         _ => {
@@ -927,17 +955,29 @@ impl RiscvGen {
                         Some(RvSymbol::PtrArray { offset }) => {
                             let addr = offset + self.extra_sp;
                             self.emit_lw("t3", addr);
+                            // Push base to stack (handles arbitrary nesting)
+                            self.emit("addi sp, sp, -4");
+                            self.emit("sw t3, 0(sp)");
+                            self.extra_sp += 4;
                             for (i, idx) in indices.iter().enumerate() {
                                 self.gen_expr(idx, frame)?;
                                 self.emit("slli a0, a0, 2");
                                 if i == 0 { self.emit("mv t2, a0"); } else { self.emit("add t2, t2, a0"); }
                             }
-                            self.emit("add t2, t3, t2");
+                            // Pop base from stack
+                            self.emit("lw t5, 0(sp)");
+                            self.emit("addi sp, sp, 4");
+                            self.extra_sp -= 4;
+                            self.emit("add t2, t5, t2");
                             self.emit("lw a0, 0(t2)");
                         }
                         Some(RvSymbol::NdParam { offset, dims }) => {
                             let addr = offset + self.extra_sp;
                             self.emit_lw("t3", addr);
+                            // Push base to stack (handles arbitrary nesting)
+                            self.emit("addi sp, sp, -4");
+                            self.emit("sw t3, 0(sp)");
+                            self.extra_sp += 4;
                             let total_dims = 1 + dims.len();
                             for (i, idx) in indices.iter().enumerate() {
                                 self.gen_expr(idx, frame)?;
@@ -946,7 +986,11 @@ impl RiscvGen {
                                 if i == 0 { self.emit("mv t2, a0"); } else { self.emit("add t2, t2, a0"); }
                             }
                             self.emit("slli t2, t2, 2");
-                            self.emit("add t2, t3, t2");
+                            // Pop base from stack
+                            self.emit("lw t5, 0(sp)");
+                            self.emit("addi sp, sp, 4");
+                            self.extra_sp -= 4;
+                            self.emit("add t2, t5, t2");
                             if indices.len() >= total_dims { self.emit("lw a0, 0(t2)"); } else { self.emit("mv a0, t2"); }
                         }
                         Some(RvSymbol::Global(label, dims)) if !dims.is_empty() => {
@@ -954,6 +998,10 @@ impl RiscvGen {
                             let arr_dims = dims.clone();
                             let total_dims = arr_dims.len();
                             self.emit(&format!("la t3, {l}"));
+                            // Push base to stack (handles arbitrary nesting)
+                            self.emit("addi sp, sp, -4");
+                            self.emit("sw t3, 0(sp)");
+                            self.extra_sp += 4;
                             for (i, idx) in indices.iter().enumerate() {
                                 self.gen_expr(idx, frame)?;
                                 let stride: i32 = arr_dims.iter().skip(i + 1).product();
@@ -961,7 +1009,11 @@ impl RiscvGen {
                                 if i == 0 { self.emit("mv t2, a0"); } else { self.emit("add t2, t2, a0"); }
                             }
                             self.emit("slli t2, t2, 2");
-                            self.emit("add t2, t3, t2");
+                            // Pop base from stack
+                            self.emit("lw t5, 0(sp)");
+                            self.emit("addi sp, sp, 4");
+                            self.extra_sp -= 4;
+                            self.emit("add t2, t5, t2");
                             if indices.len() >= total_dims { self.emit("lw a0, 0(t2)"); } else { self.emit("mv a0, t2"); }
                         }
                         _ => return Err(CompilerError::new(format!("'{name}' is not an array"))),
