@@ -1,26 +1,28 @@
 # SysY Compiler in Rust
 
-基于 PKU MiniC 在线文档从零开工的 Rust 版 SysY 编译器。
+基于 [PKU MiniC 在线文档](https://pku-minic.github.io/online-doc/) 从零开工的 Rust 版 SysY 编译器。
 
-当前版本已完成 PKU MiniC 课程全部等级 (Lv1-Lv9):
+## 测试状态
 
-- 支持课程要求的命令行接口
-- 词法分析、语法分析、AST、语义分析、代码生成
-- 可处理的 SysY 子集:
-  - 多函数定义，支持 `int`/`void` 返回类型和参数
-  - 库函数声明 (`getint`, `putint`, `getch`, `putch`, `getarray`, `putarray`, `starttime`, `stoptime`)
-  - 常量声明 (`const`) 和变量声明 (`int`)
-  - 赋值语句，支持数组元素赋值
-  - `if`/`else` 分支控制流
-  - `while`/`break`/`continue` 循环
-  - 嵌套作用域和变量遮蔽
-  - `&&`/`||` 短路求值
-  - 函数调用和参数传递
-  - 多维数组声明和索引访问
-  - 所有一元/二元运算 (`+ - ! * / % + - < > <= >= == != && ||`)
-  - 单行/多行注释
-- `-koopa` 输出文本形式 Koopa IR
-- `-riscv` 输出 RISC-V 汇编 (RV32I + 调用约定)
+| 后端 | 通过 | 总数 |
+|------|------|------|
+| Koopa IR | 130 | 130 |
+| RISC-V | ~100 | 130 |
+
+## 文件结构
+
+```
+src/
+├── main.rs        # 命令行入口
+├── lib.rs         # 库接口 (compile_source)
+├── ast.rs         # AST 定义
+├── lexer.rs       # 词法分析
+├── parser.rs      # 语法分析
+├── error.rs       # 错误类型
+├── codegen.rs     # 分发层 (generate, LIB_FUNCS)
+├── koopa_gen.rs   # Koopa IR 代码生成
+└── riscv_gen.rs   # RISC-V 汇编代码生成
+```
 
 ## 构建
 
