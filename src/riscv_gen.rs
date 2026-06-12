@@ -178,7 +178,7 @@ impl RiscvGen {
                                 let total: i32 = dims.iter().product();
                                 self.data_section.push_str(&format!("{}:\n", label));
                                 let mut vals = Vec::new();
-                                self.flatten_init_vals(&dims, &def.init, &mut vals);
+                                self.flatten_init_vals(&dims, &def.init, &mut vals, &mut vec![]);
                                 let total_usize = total as usize;
                                 if vals.len() > total_usize { vals.truncate(total_usize); }
                                 for v in &vals {
@@ -210,7 +210,7 @@ impl RiscvGen {
                                 // Emit initializer values or zeros
                                 let mut vals = Vec::new();
                                 if let Some(init) = &def.init {
-                                    self.flatten_init_vals(dims.as_slice(), init, &mut vals);
+                                    self.flatten_init_vals(dims.as_slice(), init, &mut vals, &mut vec![]);
                                     let total_usize = total as usize;
                                     if vals.len() > total_usize { vals.truncate(total_usize); }
                                     for v in &vals {
@@ -350,7 +350,8 @@ impl RiscvGen {
         Ok(out)
     }
 
-    fn flatten_init_vals(&self, dims: &[i32], init: &Expr, vals: &mut Vec<i32>) {
+    fn flatten_init_vals(&self, dims: &[i32], init: &Expr, vals: &mut Vec<i32>,
+                          runtime_inits: &mut Vec<(usize, Expr)>) {
         let start_len = vals.len();
         let total: usize = dims.iter().map(|&d| d as usize).product();
         let inner_dim = *dims.last().unwrap_or(&1) as usize;
@@ -367,18 +368,22 @@ impl RiscvGen {
                             let sub_start = vals.len();
                             let sub_dims = if dims.len() > 1 { &dims[1..] } else { &[] };
                             let sub_total: usize = sub_dims.iter().map(|&d| d as usize).product();
-                            if sub_dims.is_empty() {
-                                // 1D: just pad inner_dim
-                            }
-                            self.flatten_init_vals(sub_dims, item, vals);
-                            // Pad to fill the sub-array (advance to next sub-array boundary)
-                            let sub_end = sub_start + if sub_dims.is_empty() { inner_dim } else { sub_total * inner_dim / inner_dim };
-                            // Actually: pad so that vals.len() reaches start of next sub-array
+                            self.flatten_init_vals(sub_dims, item, vals, runtime_inits);
+                            // Pad to fill the sub-array
                             let target = sub_start + if sub_dims.is_empty() { inner_dim } else { sub_total };
                             while vals.len() < target { vals.push(0); }
                         }
                         Expr::Int(n) => vals.push(*n),
-                        e => vals.push(self.eval_const(e).unwrap_or(0)),
+                        e => {
+                            let pos = vals.len();
+                            match self.eval_const(e) {
+                                Ok(v) => vals.push(v),
+                                Err(_) => {
+                                    vals.push(0);  // placeholder
+                                    runtime_inits.push((pos, e.clone()));
+                                }
+                            }
+                        }
                     }
                 }
                 while vals.len() < start_len + total { vals.push(0); }
@@ -524,13 +529,20 @@ impl RiscvGen {
                             .collect::<CompilerResult<_>>()?;
                         // Emit init values for const arrays
                         let mut vals = Vec::new();
-                        self.flatten_init_vals(&dims, &def.init, &mut vals);
+                        let mut runtime_inits = Vec::new();
+                        self.flatten_init_vals(&dims, &def.init, &mut vals, &mut runtime_inits);
                         let total_usize: usize = dims.iter().map(|&d| d as usize).product();
                         if vals.len() > total_usize { vals.truncate(total_usize); }
                         for (i, v) in vals.iter().enumerate() {
                             self.emit(&format!("li t0, {}", v));
                             let off = adjusted_offset + i as i32 * 4;
                             self.emit_sw("t0", off);
+                        }
+                        // Emit runtime init for non-const expressions (e.g. function calls)
+                        for (pos, expr) in &runtime_inits {
+                            self.gen_expr(expr, frame)?;
+                            let off = adjusted_offset + *pos as i32 * 4;
+                            self.emit_sw("a0", off);
                         }
                         self.scopes.last_mut().unwrap().insert(
                             def.name.clone(),
@@ -566,14 +578,21 @@ impl RiscvGen {
                             .collect::<CompilerResult<_>>()?;
                         // Emit init values if present
                         let mut vals = Vec::new();
+                        let mut runtime_inits = Vec::new();
                         if let Some(init) = &def.init {
-                            self.flatten_init_vals(&dims, init, &mut vals);
+                            self.flatten_init_vals(&dims, init, &mut vals, &mut runtime_inits);
                             let total_usize: usize = dims.iter().map(|&d| d as usize).product();
                             if vals.len() > total_usize { vals.truncate(total_usize); }
                             for (i, v) in vals.iter().enumerate() {
                                 self.emit(&format!("li t0, {}", v));
                                 let offset = adjusted_offset + i as i32 * 4;
                                 self.emit_sw("t0", offset);
+                            }
+                            // Emit runtime init for non-const expressions (e.g. function calls)
+                            for (pos, expr) in &runtime_inits {
+                                self.gen_expr(expr, frame)?;
+                                let offset = adjusted_offset + *pos as i32 * 4;
+                                self.emit_sw("a0", offset);
                             }
                         }
                         self.scopes.last_mut().unwrap().insert(
