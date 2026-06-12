@@ -34,6 +34,8 @@ pub enum Type {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FuncParam {
     pub name: String,
+    pub is_array: bool,
+    pub array_dims: Vec<Expr>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,6 +110,7 @@ pub enum Expr {
         array: Box<Expr>,
         index: Box<Expr>,
     },
+    InitList(Vec<Expr>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

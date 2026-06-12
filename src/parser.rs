@@ -91,18 +91,32 @@ impl Parser {
         let mut params = Vec::new();
         if matches!(self.current_kind(), TokenKind::KwInt) {
             self.advance(); // consume "int"
-            params.push(FuncParam {
-                name: self.expect_ident()?,
-            });
+            params.push(self.parse_func_param()?);
             while matches!(self.current_kind(), TokenKind::Comma) {
                 self.advance();
                 self.expect_keyword_int()?;
-                params.push(FuncParam {
-                    name: self.expect_ident()?,
-                });
+                params.push(self.parse_func_param()?);
             }
         }
         Ok(params)
+    }
+
+    fn parse_func_param(&mut self) -> CompilerResult<FuncParam> {
+        let name = self.expect_ident()?;
+        let mut is_array = false;
+        let mut array_dims = Vec::new();
+        while matches!(self.current_kind(), TokenKind::LBracket) {
+            is_array = true;
+            self.advance();
+            if matches!(self.current_kind(), TokenKind::RBracket) {
+                self.advance();
+            } else {
+                let dim = self.parse_expr()?;
+                self.expect_r_bracket()?;
+                array_dims.push(dim);
+            }
+        }
+        Ok(FuncParam { name, is_array, array_dims })
     }
 
     fn parse_block(&mut self) -> CompilerResult<Block> {
@@ -159,7 +173,11 @@ impl Parser {
         let dims = self.parse_array_dims()?;
         let init = if matches!(self.current_kind(), TokenKind::Eq) {
             self.advance();
-            Some(self.parse_expr()?)
+            Some(if matches!(self.current_kind(), TokenKind::LBrace) {
+                self.parse_init_list()?
+            } else {
+                self.parse_expr()?
+            })
         } else {
             None
         };
@@ -564,6 +582,9 @@ impl Parser {
                 self.expect_r_paren()?;
                 expr
             }
+            TokenKind::LBrace => {
+                self.parse_init_list()?
+            }
             TokenKind::IntLiteral(value) => {
                 let value = *value;
                 self.advance();
@@ -639,6 +660,30 @@ impl Parser {
 
     fn expect_semicolon(&mut self) -> CompilerResult<()> {
         self.expect_simple(TokenKind::Semicolon, "expected ';'")
+    }
+
+    fn parse_init_list(&mut self) -> CompilerResult<Expr> {
+        self.expect_l_brace()?;
+        let mut items = Vec::new();
+        if !matches!(self.current_kind(), TokenKind::RBrace) {
+            loop {
+                if matches!(self.current_kind(), TokenKind::LBrace) {
+                    items.push(self.parse_init_list()?);
+                } else {
+                    items.push(self.parse_expr()?);
+                }
+                if matches!(self.current_kind(), TokenKind::Comma) {
+                    self.advance();
+                    if matches!(self.current_kind(), TokenKind::RBrace) {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+        self.expect_r_brace()?;
+        Ok(Expr::InitList(items))
     }
 
     fn expect_eq(&mut self) -> CompilerResult<()> {

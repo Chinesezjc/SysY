@@ -4,13 +4,13 @@ use crate::OutputMode;
 use crate::ast::{BinaryOp, Block, BlockItem, CompUnit, Decl, Expr, GlobalItem, Stmt, Type, UnaryOp};
 use crate::error::{CompilerError, CompilerResult};
 
-const LIB_FUNCS: &[(&str, Type, &[Type])] = &[
+const LIB_FUNCS: &[(&str, Type, &[&str])] = &[
     ("getint", Type::Int, &[]),
     ("getch", Type::Int, &[]),
-    ("getarray", Type::Int, &[Type::Int]),
-    ("putint", Type::Void, &[Type::Int]),
-    ("putch", Type::Void, &[Type::Int]),
-    ("putarray", Type::Void, &[Type::Int, Type::Int]),
+    ("getarray", Type::Int, &["*i32"]),
+    ("putint", Type::Void, &["i32"]),
+    ("putch", Type::Void, &["i32"]),
+    ("putarray", Type::Void, &["i32", "*i32"]),
     ("starttime", Type::Void, &[]),
     ("stoptime", Type::Void, &[]),
 ];
@@ -36,7 +36,9 @@ fn lib_func_ret_type(name: &str) -> Option<Type> {
 enum Symbol {
     Const(i32),
     Var(String),
-    Array(String),
+    Array(String, usize),
+    PtrArray(String),
+    NdParam { name: String, dims: Vec<i32> },
 }
 
 struct KoopaGen {
@@ -55,6 +57,7 @@ struct KoopaGen {
     func_ret_types: HashMap<String, Type>,
     pending_sc_allocas: Vec<String>,
     block_terminated: bool,
+    param_sig_names: HashMap<String, String>,
 }
 
 impl KoopaGen {
@@ -75,6 +78,7 @@ impl KoopaGen {
             func_ret_types: HashMap::new(),
             pending_sc_allocas: Vec::new(),
             block_terminated: false,
+            param_sig_names: HashMap::new(),
         }
     }
 
@@ -152,17 +156,10 @@ impl KoopaGen {
         }
         self.lib_funcs_emitted.insert(name.to_string());
         if let Some((_, ret_ty, param_types)) = LIB_FUNCS.iter().find(|(n, _, _)| *n == name) {
-            let params: Vec<String> = param_types
-                .iter()
-                .map(|t| match t {
-                    Type::Int => "i32".to_string(),
-                    Type::Void => unreachable!(),
-                })
-                .collect();
-            let params_str = if params.is_empty() {
+            let params_str = if param_types.is_empty() {
                 String::new()
             } else {
-                params.join(", ")
+                param_types.join(", ")
             };
             let ret_str = match ret_ty {
                 Type::Int => ": i32",
@@ -176,6 +173,107 @@ impl KoopaGen {
         match t {
             Type::Int => "i32",
             Type::Void => "",
+        }
+    }
+
+    fn array_type_str(dims: &[i32]) -> String {
+        let mut result = "i32".to_string();
+        for &dim in dims.iter().rev() {
+            result = format!("[{result}, {dim}]");
+        }
+        result
+    }
+
+    fn global_init_string(&self, dims: &[i32], init: &Expr) -> String {
+        let mut flat = Vec::new();
+        Self::flatten_init(dims, init, &mut flat);
+        let total: usize = dims.iter().map(|&d| d as usize).product();
+        while flat.len() < total {
+            flat.push(Expr::Int(0));
+        }
+        let flat_vals: Vec<i32> = flat.iter()
+            .map(|e| self.eval_const(e).unwrap_or(0))
+            .collect();
+        let mut start = 0usize;
+        Self::build_init_str(dims, &flat_vals, &mut start)
+    }
+
+    fn flatten_init(dims: &[i32], init: &Expr, flat: &mut Vec<Expr>) {
+        let total: usize = dims.iter().map(|&d| d as usize).product();
+        match init {
+            Expr::InitList(items) => {
+                if items.is_empty() { return; }
+                let has_nested = items.iter().any(|i| matches!(i, Expr::InitList(_)));
+                if dims.len() <= 1 || !has_nested {
+                    for item in items {
+                        match item {
+                            Expr::InitList(_) => Self::flatten_init(&[], item, flat),
+                            _ => flat.push(item.clone()),
+                        }
+                    }
+                } else {
+                    let sub_dims = &dims[1..];
+                    let sub_size: usize = sub_dims.iter().map(|&d| d as usize).product();
+                    for item in items {
+                        let before = flat.len();
+                        match item {
+                            Expr::InitList(_) => Self::flatten_init(sub_dims, item, flat),
+                            _ => { flat.push(item.clone()); }
+                        }
+                        let after = flat.len();
+                        let remainder = (sub_size - (after - before) % sub_size) % sub_size;
+                        for _ in 0..remainder { flat.push(Expr::Int(0)); }
+                    }
+                }
+            }
+            _ => { flat.push(init.clone()); }
+        }
+        while flat.len() < total { flat.push(Expr::Int(0)); }
+    }
+
+    fn build_init_str(dims: &[i32], flat: &[i32], start: &mut usize) -> String {
+        if dims.is_empty() {
+            let v = flat.get(*start).copied().unwrap_or(0);
+            *start += 1;
+            return v.to_string();
+        }
+        let count = dims[0] as usize;
+        let sub_dims = &dims[1..];
+        let mut parts = Vec::new();
+        for _ in 0..count {
+            parts.push(Self::build_init_str(sub_dims, flat, start));
+        }
+        format!("{{{}}}", parts.join(", "))
+    }
+
+    fn gen_array_init(&mut self, base: &str, dims: &[i32], init: &Expr) -> CompilerResult<()> {
+        let mut flat = Vec::new();
+        Self::flatten_init(dims, init, &mut flat);
+        let total: usize = dims.iter().map(|&d| d as usize).product();
+        while flat.len() < total { flat.push(Expr::Int(0)); }
+        for (i, item) in flat.iter().enumerate().take(total) {
+            let val = self.gen_expr(item)?;
+            self.gen_array_store(base, dims, i as i32, &val);
+        }
+        Ok(())
+    }
+
+    fn gen_array_store(&mut self, base_ptr: &str, dims: &[i32], flat_idx: i32, val: &str) {
+        if dims.len() == 1 {
+            let p0 = self.alloc_tmp();
+            self.emit(&format!("{p0} = getelemptr {base_ptr}, 0"));
+            let p1 = self.alloc_tmp();
+            self.emit(&format!("{p1} = getptr {p0}, {flat_idx}"));
+            self.emit(&format!("store {val}, {p1}"));
+        } else {
+            let sub_size: i32 = dims[1..].iter().product();
+            let outer_idx = flat_idx / sub_size;
+            let inner_idx = flat_idx % sub_size;
+            let p0 = self.alloc_tmp();
+            self.emit(&format!("{p0} = getelemptr {base_ptr}, 0"));
+            let p1 = self.alloc_tmp();
+            self.emit(&format!("{p1} = getptr {p0}, {outer_idx}"));
+            self.gen_array_store(&p1, &dims[1..], inner_idx, val);
         }
     }
 
@@ -195,8 +293,22 @@ impl KoopaGen {
                     match decl {
                         Decl::Const(defs) => {
                             for def in defs {
-                                let val = self.eval_const(&def.init)?;
-                                self.globals.insert(def.name.clone(), Symbol::Const(val));
+                                if def.dims.is_empty() && !matches!(&def.init, Expr::InitList(_)) {
+                                    let val = self.eval_const(&def.init)?;
+                                    self.globals.insert(def.name.clone(), Symbol::Const(val));
+                                } else {
+                                    // Const array: allocate in global data
+                                    let label = def.name.clone();
+                                    let dims: Vec<i32> = def.dims.iter()
+                                        .map(|d| self.eval_const(d))
+                                        .collect::<CompilerResult<_>>()?;
+                                    let array_type = Self::array_type_str(&dims);
+                                    let init_str = self.global_init_string(&dims, &def.init);
+                                    self.global_decls.push_str(&format!(
+                                        "global @{} = alloc {}, {}\n", label, array_type, init_str
+                                    ));
+                                    self.globals.insert(label.clone(), Symbol::Array(label, dims.len()));
+                                }
                             }
                         }
                         Decl::Var(defs) => {
@@ -212,15 +324,19 @@ impl KoopaGen {
                                     ));
                                     self.globals.insert(def.name.clone(), Symbol::Var(def.name.clone()));
                                 } else {
-                                    let dims_str: Vec<String> = def.dims.iter()
-                                        .rev()
-                                        .map(|d| format!("i32, {}", self.eval_const(d).unwrap_or(1)))
-                                        .collect();
-                                    let array_type = format!("[{}]", dims_str.join(", "));
+                                    let dims: Vec<i32> = def.dims.iter()
+                                        .map(|d| self.eval_const(d))
+                                        .collect::<CompilerResult<_>>()?;
+                                    let array_type = Self::array_type_str(&dims);
+                                    let init_str = if let Some(init) = &def.init {
+                                        self.global_init_string(&dims, init)
+                                    } else {
+                                        "zeroinit".to_string()
+                                    };
                                     self.global_decls.push_str(&format!(
-                                        "global @{} = alloc {}\n", def.name, array_type
+                                        "global @{} = alloc {}, {}\n", def.name, array_type, init_str
                                     ));
-                                    self.globals.insert(def.name.clone(), Symbol::Array(def.name.clone()));
+                                    self.globals.insert(def.name.clone(), Symbol::Array(def.name.clone(), dims.len()));
                                 }
                             }
                         }
@@ -248,20 +364,43 @@ impl KoopaGen {
 
                     // Add function params to scope
                     for param in &func.params {
-                        // Reserve source name for function signature param
-                        self.mangle(&param.name);
-                        // Use a unique name for the local alloca
-                        let koopa_name = self.mangle(&param.name);
-                        self.pending_sc_allocas
-                            .push(format!("@{koopa_name} = alloc i32"));
-                        self.emit(&format!(
-                            "store @{}, @{}",
-                            param.name, koopa_name
-                        ));
-                        self.scopes
-                            .last_mut()
-                            .unwrap()
-                            .insert(param.name.clone(), Symbol::Var(koopa_name));
+                        if param.is_array {
+                            if self.globals.contains_key(&param.name) {
+                                self.mangle(&param.name);
+                            }
+                            let koopa_name = self.mangle(&param.name);
+                            self.param_sig_names.insert(param.name.clone(), koopa_name.clone());
+                            if param.array_dims.is_empty() {
+                                self.scopes.last_mut().unwrap()
+                                    .insert(param.name.clone(), Symbol::PtrArray(koopa_name));
+                            } else {
+                                let fixed_dims: Vec<i32> = param.array_dims.iter()
+                                    .map(|d| self.eval_const(d).unwrap_or(1))
+                                    .collect();
+                                self.scopes.last_mut().unwrap()
+                                    .insert(param.name.clone(), Symbol::NdParam {
+                                        name: koopa_name,
+                                        dims: fixed_dims,
+                                    });
+                            }
+                        } else {
+                            if self.globals.contains_key(&param.name) {
+                                self.mangle(&param.name);
+                            }
+                            let sig_name = self.mangle(&param.name);
+                            let koopa_name = self.mangle(&param.name);
+                            self.pending_sc_allocas
+                                .push(format!("@{koopa_name} = alloc i32"));
+                            self.emit(&format!(
+                                "store @{}, @{}",
+                                sig_name, koopa_name
+                            ));
+                            self.scopes
+                                .last_mut()
+                                .unwrap()
+                                .insert(param.name.clone(), Symbol::Var(koopa_name));
+                            self.param_sig_names.insert(param.name.clone(), sig_name);
+                        }
                     }
 
                     self.gen_block(&func.body)?;
@@ -283,7 +422,27 @@ impl KoopaGen {
                     let params_str: Vec<String> = func
                         .params
                         .iter()
-                        .map(|p| format!("@{}: i32", p.name))
+                        .map(|p| {
+                            if p.is_array {
+                                let sig_name = self.param_sig_names.get(&p.name)
+                                    .cloned()
+                                    .unwrap_or_else(|| p.name.clone());
+                                if p.array_dims.is_empty() {
+                                    format!("@{sig_name}: *i32")
+                                } else {
+                                    let eval_dims: Vec<i32> = p.array_dims.iter()
+                                        .map(|d| self.eval_const(d).unwrap_or(1))
+                                        .collect();
+                                    let inner = Self::array_type_str(&eval_dims);
+                                    format!("@{sig_name}: *{}", inner)
+                                }
+                            } else {
+                                let sig_name = self.param_sig_names.get(&p.name)
+                                    .cloned()
+                                    .unwrap_or_else(|| p.name.clone());
+                                format!("@{sig_name}: i32")
+                            }
+                        })
                         .collect();
                     let params_sig = if params_str.is_empty() {
                         String::new()
@@ -386,6 +545,11 @@ impl KoopaGen {
                 self.find_calls_in_expr(array);
                 self.find_calls_in_expr(index);
             }
+            Expr::InitList(items) => {
+                for item in items {
+                    self.find_calls_in_expr(item);
+                }
+            }
             _ => {}
         }
     }
@@ -413,11 +577,33 @@ impl KoopaGen {
                             def.name
                         )));
                     }
-                    let val = self.eval_const(&def.init)?;
-                    self.scopes
-                        .last_mut()
-                        .unwrap()
-                        .insert(def.name.clone(), Symbol::Const(val));
+                    if def.dims.is_empty() && !matches!(&def.init, Expr::InitList(_)) {
+                        let val = self.eval_const(&def.init)?;
+                        self.scopes
+                            .last_mut()
+                            .unwrap()
+                            .insert(def.name.clone(), Symbol::Const(val));
+                    } else {
+                        // Const array: allocate and initialize like var array
+                        if self.globals.contains_key(&def.name) {
+                            self.mangle(&def.name);
+                        }
+                        let koopa_name = self.mangle(&def.name);
+                        let dims: Vec<i32> = def.dims.iter()
+                            .map(|d| self.eval_const(d))
+                            .collect::<CompilerResult<_>>()?;
+                        let array_type = Self::array_type_str(&dims);
+                        let base = format!("@{koopa_name}");
+                        self.pending_sc_allocas.push(format!(
+                            "{base} = alloc {}",
+                            array_type
+                        ));
+                        self.scopes
+                            .last_mut()
+                            .unwrap()
+                            .insert(def.name.clone(), Symbol::Array(koopa_name, dims.len()));
+                        self.gen_array_init(&base, &dims, &def.init)?;
+                    }
                 }
             }
             Decl::Var(defs) => {
@@ -445,21 +631,22 @@ impl KoopaGen {
                             .unwrap()
                             .insert(def.name.clone(), Symbol::Var(koopa_name));
                     } else {
-                        let dims_str: Vec<String> = def
-                            .dims
-                            .iter()
-                            .rev()
-                            .map(|d| format!("i32, {}", self.eval_const(d).unwrap_or(1)))
-                            .collect();
-                        let array_type = format!("[{}]", dims_str.join(", "));
+                        let dims: Vec<i32> = def.dims.iter()
+                            .map(|d| self.eval_const(d))
+                            .collect::<CompilerResult<_>>()?;
+                        let array_type = Self::array_type_str(&dims);
+                        let base = format!("@{koopa_name}");
                         self.pending_sc_allocas.push(format!(
-                            "@{koopa_name} = alloc {}",
+                            "{base} = alloc {}",
                             array_type
                         ));
                         self.scopes
                             .last_mut()
                             .unwrap()
-                            .insert(def.name.clone(), Symbol::Array(koopa_name));
+                            .insert(def.name.clone(), Symbol::Array(koopa_name, dims.len()));
+                        if let Some(init) = &def.init {
+                            self.gen_array_init(&base, &dims, init)?;
+                        }
                     }
                 }
             }
@@ -501,26 +688,60 @@ impl KoopaGen {
                     let val = self.gen_expr(expr)?;
                     self.emit(&format!("store {val}, @{koopa_name}"));
                 } else {
-                    let koopa_name = match self.lookup(name) {
-                        Some(Symbol::Array(n)) => n.clone(),
-                        _ => {
-                            return Err(CompilerError::new(format!(
-                                "'{name}' is not an array"
-                            )));
+                    match self.lookup(name) {
+                        Some(Symbol::NdParam { name: param_name, dims }) => {
+                            let n = param_name.clone();
+                            let dims = dims.clone();
+                            let val = self.gen_expr(expr)?;
+                            let total_dims = 1 + dims.len();
+                            let first_idx = self.gen_expr(&index[0])?;
+                            let p = self.alloc_tmp();
+                            self.emit(&format!("{p} = getptr @{n}, {first_idx}"));
+                            let p0 = self.alloc_tmp();
+                            self.emit(&format!("{p0} = getelemptr {p}, 0"));
+                            let mut ptr = p0;
+                            for (i, idx) in index.iter().enumerate().skip(1) {
+                                let idx_val = self.gen_expr(idx)?;
+                                let p1 = self.alloc_tmp();
+                                self.emit(&format!("{p1} = getptr {ptr}, {idx_val}"));
+                                ptr = p1;
+                                if i < total_dims - 1 {
+                                    let p2 = self.alloc_tmp();
+                                    self.emit(&format!("{p2} = getelemptr {ptr}, 0"));
+                                    ptr = p2;
+                                }
+                            }
+                            self.emit(&format!("store {val}, {ptr}"));
                         }
-                    };
-                    let val = self.gen_expr(expr)?;
-                    // Build the pointer chain
-                    let mut ptr = format!("@{}", koopa_name);
-                    for idx in index {
-                        let idx_val = self.gen_expr(idx)?;
-                        let p0 = self.alloc_tmp();
-                        self.emit(&format!("{p0} = getelemptr {ptr}, 0"));
-                        let p1 = self.alloc_tmp();
-                        self.emit(&format!("{p1} = getptr {p0}, {idx_val}"));
-                        ptr = p1;
+                        _ => {
+                            let (koopa_name, is_ptr_array) = match self.lookup(name) {
+                                Some(Symbol::Array(n, _)) => (n.clone(), false),
+                                Some(Symbol::PtrArray(n)) => (n.clone(), true),
+                                _ => {
+                                    return Err(CompilerError::new(format!(
+                                        "'{name}' is not an array"
+                                    )));
+                                }
+                            };
+                            let val = self.gen_expr(expr)?;
+                            let mut ptr = format!("@{}", koopa_name);
+                            for idx in index {
+                                let idx_val = self.gen_expr(idx)?;
+                                if is_ptr_array {
+                                    let p = self.alloc_tmp();
+                                    self.emit(&format!("{p} = getptr {ptr}, {idx_val}"));
+                                    ptr = p;
+                                } else {
+                                    let p0 = self.alloc_tmp();
+                                    self.emit(&format!("{p0} = getelemptr {ptr}, 0"));
+                                    let p1 = self.alloc_tmp();
+                                    self.emit(&format!("{p1} = getptr {p0}, {idx_val}"));
+                                    ptr = p1;
+                                }
+                            }
+                            self.emit(&format!("store {val}, {ptr}"));
+                        }
                     }
-                    self.emit(&format!("store {val}, {ptr}"));
                 }
             }
             Stmt::Expr(expr) => {
@@ -659,6 +880,9 @@ impl KoopaGen {
             Expr::Index { .. } => Err(CompilerError::new(
                 "array access is not a compile-time constant",
             )),
+            Expr::InitList(_) => Err(CompilerError::new(
+                "initializer list is not a compile-time constant",
+            )),
         }
     }
 
@@ -685,11 +909,17 @@ impl KoopaGen {
                         self.emit(&format!("{tmp} = load @{koopa_name}"));
                         Ok(tmp)
                     }
-                    Some(Symbol::Array(n)) => {
+                    Some(Symbol::Array(n, _)) => {
                         let n = n.clone();
                         let tmp = self.alloc_tmp();
                         self.emit(&format!("{tmp} = getelemptr @{n}, 0"));
                         Ok(tmp)
+                    }
+                    Some(Symbol::PtrArray(n)) => {
+                        Ok(format!("@{}", n))
+                    }
+                    Some(Symbol::NdParam { name, .. }) => {
+                        Ok(format!("@{}", name))
                     }
                     None => Err(CompilerError::new(format!(
                         "undefined identifier '{name}'"
@@ -778,15 +1008,66 @@ impl KoopaGen {
                 }
             },
             Expr::Index { array, index } => {
+                // Check for NdParam — handle with gen_ndparam_index
+                if let Some(_dims) = self.get_ndparam_dims(expr) {
+                    return self.gen_ndparam_index(expr);
+                }
+                // Check if base is a PtrArray (already a pointer, no getelemptr needed)
+                let is_ptr = match array.as_ref() {
+                    Expr::LVal(name) => matches!(self.lookup(name), Some(Symbol::PtrArray(_))),
+                    _ => false,
+                };
                 let idx_val = self.gen_expr(index)?;
                 let base = self.gen_expr_base(array)?;
-                let p0 = self.alloc_tmp();
-                self.emit(&format!("{p0} = getelemptr {base}, 0"));
-                let p1 = self.alloc_tmp();
-                self.emit(&format!("{p1} = getptr {p0}, {idx_val}"));
-                let result = self.alloc_tmp();
-                self.emit(&format!("{result} = load {p1}"));
-                Ok(result)
+                let elem_ptr = if is_ptr {
+                    let p = self.alloc_tmp();
+                    self.emit(&format!("{p} = getptr {base}, {idx_val}"));
+                    p
+                } else {
+                    let p0 = self.alloc_tmp();
+                    self.emit(&format!("{p0} = getelemptr {base}, 0"));
+                    let p1 = self.alloc_tmp();
+                    self.emit(&format!("{p1} = getptr {p0}, {idx_val}"));
+                    p1
+                };
+                let num_indices = 1 + Self::count_indices(array);
+                let total_dims = match array.as_ref() {
+                    Expr::LVal(name) => match self.lookup(name) {
+                        Some(Symbol::Array(_, ndims)) => *ndims,
+                        Some(Symbol::PtrArray(_)) => 1,
+                        _ => 1,
+                    },
+                    Expr::Index { .. } => {
+                        let mut cur = array.as_ref();
+                        loop {
+                            match cur {
+                                Expr::LVal(name) => break match self.lookup(name) {
+                                    Some(Symbol::Array(_, ndims)) => *ndims,
+                                    _ => 1,
+                                },
+                                Expr::Index { array: a, .. } => cur = a.as_ref(),
+                                _ => break 1,
+                            }
+                        }
+                    }
+                    _ => 1,
+                };
+                if num_indices >= total_dims {
+                    let result = self.alloc_tmp();
+                    self.emit(&format!("{result} = load {elem_ptr}"));
+                    Ok(result)
+                } else {
+                    let decay = self.alloc_tmp();
+                    self.emit(&format!("{decay} = getelemptr {elem_ptr}, 0"));
+                    Ok(decay)
+                }
+            }
+            Expr::InitList(items) => {
+                let mut last = String::new();
+                for item in items {
+                    last = self.gen_expr(item)?;
+                }
+                Ok(last)
             }
             Expr::Call { name, args } => {
                 if is_lib_func(name) {
@@ -819,10 +1100,81 @@ impl KoopaGen {
         }
     }
 
+    fn get_ndparam_dims(&self, expr: &Expr) -> Option<Vec<i32>> {
+        match expr {
+            Expr::LVal(name) => match self.lookup(name) {
+                Some(Symbol::NdParam { dims, .. }) => Some(dims.clone()),
+                _ => None,
+            },
+            Expr::Index { array, .. } => self.get_ndparam_dims(array),
+            _ => None,
+        }
+    }
+
+    fn count_indices(expr: &Expr) -> usize {
+        match expr {
+            Expr::Index { array, .. } => 1 + Self::count_indices(array),
+            _ => 0,
+        }
+    }
+
+    fn gen_ndparam_index(&mut self, idx_expr: &Expr) -> CompilerResult<String> {
+        let mut indices: Vec<&Expr> = Vec::new();
+        let mut cur = idx_expr;
+        let base_name;
+        let dims;
+        loop {
+            match cur {
+                Expr::Index { array, index } => {
+                    indices.push(index.as_ref());
+                    cur = array.as_ref();
+                }
+                Expr::LVal(name) => {
+                    if let Some(Symbol::NdParam { name: koopa_name, dims: d }) = self.lookup(name) {
+                        base_name = koopa_name.clone();
+                        dims = d.clone();
+                    } else {
+                        return Err(CompilerError::new("expected NdParam"));
+                    }
+                    break;
+                }
+                _ => return Err(CompilerError::new("invalid array access")),
+            }
+        }
+        indices.reverse();
+        let total_dims = 1 + dims.len();
+
+        let first_idx = self.gen_expr(indices[0])?;
+        let p = self.alloc_tmp();
+        self.emit(&format!("{p} = getptr @{base_name}, {first_idx}"));
+        let p0 = self.alloc_tmp();
+        self.emit(&format!("{p0} = getelemptr {p}, 0"));
+        let mut ptr = p0;
+        for (i, idx) in indices.iter().enumerate().skip(1) {
+            let idx_val = self.gen_expr(idx)?;
+            let p1 = self.alloc_tmp();
+            self.emit(&format!("{p1} = getptr {ptr}, {idx_val}"));
+            ptr = p1;
+            if i < total_dims - 1 {
+                let p2 = self.alloc_tmp();
+                self.emit(&format!("{p2} = getelemptr {ptr}, 0"));
+                ptr = p2;
+            }
+        }
+        if indices.len() >= total_dims {
+            let result = self.alloc_tmp();
+            self.emit(&format!("{result} = load {ptr}"));
+            Ok(result)
+        } else {
+            Ok(ptr)
+        }
+    }
+
     fn gen_expr_base(&mut self, expr: &Expr) -> CompilerResult<String> {
         match expr {
             Expr::LVal(name) => match self.lookup(name) {
-                Some(Symbol::Var(n)) | Some(Symbol::Array(n)) => Ok(format!("@{}", n)),
+                Some(Symbol::Var(n)) | Some(Symbol::Array(n, _)) | Some(Symbol::PtrArray(n)) => Ok(format!("@{}", n)),
+                Some(Symbol::NdParam { name: n, .. }) => Ok(format!("@{}", n)),
                 _ => Err(CompilerError::new(format!("'{name}' is not an lvalue"))),
             },
             Expr::Index { array, index } => {
@@ -1407,6 +1759,9 @@ impl RiscvGen {
             Expr::Index { .. } => Err(CompilerError::new(
                 "array access is not a compile-time constant",
             )),
+            Expr::InitList(_) => Err(CompilerError::new(
+                "initializer list is not a compile-time constant",
+            )),
         }
     }
 
@@ -1559,6 +1914,11 @@ impl RiscvGen {
                 } else {
                     return Err(CompilerError::new("invalid array access"));
                 }
+            }
+            Expr::InitList(_) => {
+                return Err(CompilerError::new(
+                    "initializer list not allowed in expression context",
+                ));
             }
             Expr::Call { name, args } => {
                 for (_i, arg) in args.iter().enumerate() {
