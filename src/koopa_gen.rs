@@ -176,7 +176,6 @@ impl KoopaGen {
         let total: usize = dims.iter().map(|&d| d as usize).product();
         match init {
             Expr::InitList(items) => {
-                if items.is_empty() { return; }
                 let has_nested = items.iter().any(|i| matches!(i, Expr::InitList(_)));
                 if dims.len() <= 1 || !has_nested {
                     for item in items {
@@ -199,6 +198,7 @@ impl KoopaGen {
                         for _ in 0..remainder { flat.push(Expr::Int(0)); }
                     }
                 }
+                while flat.len() < total { flat.push(Expr::Int(0)); }
             }
             _ => { flat.push(init.clone()); }
         }
