@@ -173,36 +173,34 @@ impl KoopaGen {
     }
 
     fn flatten_init(dims: &[i32], init: &Expr, flat: &mut Vec<Expr>) {
+        let start_len = flat.len();
         let total: usize = dims.iter().map(|&d| d as usize).product();
+        let inner_dim = *dims.last().unwrap_or(&1) as usize;
         match init {
             Expr::InitList(items) => {
-                let has_nested = items.iter().any(|i| matches!(i, Expr::InitList(_)));
-                if dims.len() <= 1 || !has_nested {
-                    for item in items {
-                        match item {
-                            Expr::InitList(_) => Self::flatten_init(&[], item, flat),
-                            _ => flat.push(item.clone()),
+                for item in items {
+                    match item {
+                        Expr::InitList(_) => {
+                            // Align to innermost boundary
+                            let rem = (inner_dim - (flat.len() - start_len) % inner_dim) % inner_dim;
+                            for _ in 0..rem { flat.push(Expr::Int(0)); }
+                            // Process sub-init (fills one complete sub-array)
+                            let sub_start = flat.len();
+                            let sub_dims = if dims.len() > 1 { &dims[1..] } else { &[] };
+                            let sub_total: usize = sub_dims.iter().map(|&d| d as usize).product();
+                            Self::flatten_init(sub_dims, item, flat);
+                            // Pad to fill sub-array
+                            let target = sub_start + if sub_dims.is_empty() { inner_dim } else { sub_total };
+                            while flat.len() < target { flat.push(Expr::Int(0)); }
                         }
-                    }
-                } else {
-                    let sub_dims = &dims[1..];
-                    let sub_size: usize = sub_dims.iter().map(|&d| d as usize).product();
-                    for item in items {
-                        let before = flat.len();
-                        match item {
-                            Expr::InitList(_) => Self::flatten_init(sub_dims, item, flat),
-                            _ => { flat.push(item.clone()); }
-                        }
-                        let after = flat.len();
-                        let remainder = (sub_size - (after - before) % sub_size) % sub_size;
-                        for _ in 0..remainder { flat.push(Expr::Int(0)); }
+                        _ => flat.push(item.clone()),
                     }
                 }
-                while flat.len() < total { flat.push(Expr::Int(0)); }
+                while flat.len() < start_len + total { flat.push(Expr::Int(0)); }
             }
             _ => { flat.push(init.clone()); }
         }
-        while flat.len() < total { flat.push(Expr::Int(0)); }
+        while flat.len() < start_len + total { flat.push(Expr::Int(0)); }
     }
 
     fn build_init_str(dims: &[i32], flat: &[i32], start: &mut usize) -> String {
