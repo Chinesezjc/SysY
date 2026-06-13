@@ -1157,8 +1157,9 @@ impl RiscvGen {
                 // Pop remaining stack args
                 let stack_args = args.len().saturating_sub(8);
                 if stack_args > 0 {
-                    self.emit(&format!("addi sp, sp, {}", stack_args * 4));
-                    self.extra_sp -= (stack_args * 4) as i32;
+                    let delta = (stack_args * 4) as i32;
+                    self.emit_sp_add(delta);
+                    self.extra_sp -= delta;
                 }
             }
         }
