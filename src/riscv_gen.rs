@@ -1042,7 +1042,7 @@ impl RiscvGen {
                                 self.gen_expr(idx, frame)?;
                                 if i > 0 { self.emit_pop_t2(); }
                                 let stride: i32 = arr_dims.iter().skip(i + 1).product();
-                                if stride != 1 { self.emit(&format!("li t1, {}", stride)); self.emit("mul a0, a0, t1"); }
+                                if stride != 1 { self.emit(&format!("li t0, {}", stride)); self.emit("mul a0, a0, t0"); }
                                 if i == 0 { self.emit("mv t2, a0"); } else { self.emit("add t2, t2, a0"); }
                             }
                             self.emit("slli t2, t2, 2");
@@ -1084,7 +1084,7 @@ impl RiscvGen {
                                 self.gen_expr(idx, frame)?;
                                 if i > 0 { self.emit_pop_t2(); }
                                 let stride: i32 = if i == 0 { dims.iter().product() } else { dims.iter().skip(i).product() };
-                                if stride != 1 { self.emit(&format!("li t1, {}", stride)); self.emit("mul a0, a0, t1"); }
+                                if stride != 1 { self.emit(&format!("li t0, {}", stride)); self.emit("mul a0, a0, t0"); }
                                 if i == 0 { self.emit("mv t2, a0"); } else { self.emit("add t2, t2, a0"); }
                             }
                             self.emit("slli t2, t2, 2");
@@ -1109,7 +1109,7 @@ impl RiscvGen {
                                 self.gen_expr(idx, frame)?;
                                 if i > 0 { self.emit_pop_t2(); }
                                 let stride: i32 = arr_dims.iter().skip(i + 1).product();
-                                if stride != 1 { self.emit(&format!("li t1, {}", stride)); self.emit("mul a0, a0, t1"); }
+                                if stride != 1 { self.emit(&format!("li t0, {}", stride)); self.emit("mul a0, a0, t0"); }
                                 if i == 0 { self.emit("mv t2, a0"); } else { self.emit("add t2, t2, a0"); }
                             }
                             self.emit("slli t2, t2, 2");
