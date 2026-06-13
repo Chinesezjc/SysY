@@ -357,7 +357,6 @@ impl RiscvGen {
         let inner_dim = *dims.last().unwrap_or(&1) as usize;
         match init {
             Expr::InitList(items) => {
-                if items.is_empty() { return; }
                 for item in items {
                     match item {
                         Expr::InitList(_) => {
