@@ -20,10 +20,19 @@ fn run() -> Result<(), String> {
     let cli = CliArgs::parse(&args)?;
     let source = fs::read_to_string(&cli.input)
         .map_err(|error| format!("failed to read '{}': {error}", cli.input))?;
-    let output = compile_source(&source, cli.mode).map_err(|error| error.to_string())?;
-    fs::write(&cli.output, output)
-        .map_err(|error| format!("failed to write '{}': {error}", cli.output))?;
-    Ok(())
+    match compile_source(&source, cli.mode) {
+        Ok(output) => {
+            fs::write(&cli.output, output)
+                .map_err(|error| format!("failed to write '{}': {error}", cli.output))?;
+            Ok(())
+        }
+        Err(error) => {
+            let msg = format!("compile error: {error}");
+            // Write error to output file so platform can see it
+            let _ = fs::write(&cli.output, &msg);
+            Err(msg)
+        }
+    }
 }
 
 struct CliArgs {
