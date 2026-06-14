@@ -377,9 +377,13 @@ impl KoopaGen {
 
                     self.gen_block(&func.body)?;
 
-                    // Ensure void functions have a ret at end
-                    if func.ret_type == Type::Void && !self.block_terminated {
-                        self.emit("ret");
+                    // Ensure functions have a ret at end (last block needs a terminator)
+                    if !self.block_terminated {
+                        if func.ret_type == Type::Void {
+                            self.emit("ret");
+                        } else {
+                            self.emit("ret 0");
+                        }
                         self.block_terminated = true;
                     }
 
