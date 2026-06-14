@@ -9,6 +9,7 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
             eprintln!("{message}");
+            println!("compile error: {message}");
             ExitCode::FAILURE
         }
     }
