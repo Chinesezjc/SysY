@@ -26,6 +26,7 @@ pub(crate) struct RiscvGen {
     label: usize,
     loop_stack: Vec<(String, String)>,
     current_ret_type: Type,
+    block_terminated: bool,
     data_section: String,
     out: String,
 }
@@ -43,6 +44,7 @@ impl RiscvGen {
             label: 0,
             loop_stack: Vec::new(),
             current_ret_type: Type::Int,
+            block_terminated: false,
             data_section: String::new(),
             out: String::new(),
         }
@@ -248,6 +250,7 @@ impl RiscvGen {
                     self.out.clear();
                     self.loop_stack.clear();
                     self.current_ret_type = func.ret_type;
+                    self.block_terminated = false;
 
                     // First pass: collect variables
                     let mut slot = 0i32;
@@ -334,8 +337,11 @@ impl RiscvGen {
 
                     self.gen_block(&func.body, aligned_frame)?;
 
-                    // Ensure void functions return
-                    if func.ret_type == Type::Void {
+                    // Ensure unterminated functions get an epilogue
+                    if !self.block_terminated {
+                        if func.ret_type != Type::Void {
+                            self.emit("li a0, 0");
+                        }
                         let ra_offset = aligned_frame - 4;
                         self.emit_lw("ra", ra_offset);
                         self.emit_sp_add(aligned_frame);
@@ -620,6 +626,7 @@ impl RiscvGen {
                 self.emit_lw("ra", ra_offset);
                 self.emit_sp_add(frame);
                 self.emit("ret");
+                self.block_terminated = true;
             }
             Stmt::Assign { name, index, expr } => {
                 if index.is_empty() {
