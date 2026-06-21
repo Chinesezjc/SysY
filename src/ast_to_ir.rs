@@ -827,7 +827,17 @@ impl AstToIr {
         Self::flatten_init_static(dims, init, &mut flat);
         let mut vals: Vec<i32> = Vec::new();
         for e in &flat {
-            if let Expr::Int(n) = e { vals.push(*n); } else { vals.push(0); }
+            match e {
+                Expr::Int(n) => vals.push(*n),
+                _ => {
+                    // Try to evaluate constant expression
+                    if let Ok(v) = self.eval_const(e) {
+                        vals.push(v);
+                    } else {
+                        vals.push(0);
+                    }
+                }
+            }
         }
         while vals.len() < total { vals.push(0); }
         IrGlobalInit::Values(vals)
