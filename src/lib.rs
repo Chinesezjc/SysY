@@ -1,5 +1,6 @@
 mod ast;
 mod ast_to_ir;
+mod cfg;
 mod codegen;
 mod error;
 mod ir;
@@ -9,6 +10,7 @@ mod koopa_gen;
 mod lexer;
 mod parser;
 mod riscv_gen;
+mod ssa;
 
 pub use error::{CompilerError, CompilerResult};
 

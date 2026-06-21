@@ -2,6 +2,7 @@ use crate::ast_to_ir;
 use crate::ir_to_koopa;
 use crate::koopa_gen;
 use crate::riscv_gen;
+use crate::ssa;
 
 use crate::OutputMode;
 use crate::ast::{CompUnit, Type};
@@ -24,6 +25,7 @@ pub fn generate(program: &CompUnit, mode: OutputMode) -> CompilerResult<String> 
         OutputMode::Riscv => riscv_gen::RiscvGen::new().gen_program(program),
         OutputMode::KoopaIr => {
             let ir = ast_to_ir::AstToIr::new().gen_program(program)?;
+            // TODO: run optimization passes (Mem2Reg, ConstFold, DCE, GVN) here
             Ok(ir_to_koopa::emit_koopa(&ir))
         }
     }
