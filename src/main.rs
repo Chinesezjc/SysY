@@ -53,6 +53,7 @@ impl CliArgs {
         let mode = match args[1].as_str() {
             "-koopa" => OutputMode::Koopa,
             "-riscv" => OutputMode::Riscv,
+            "-koopair" => OutputMode::KoopaIr,
             _ => return Err(Self::usage()),
         };
 
@@ -68,6 +69,6 @@ impl CliArgs {
     }
 
     fn usage() -> String {
-        "usage: compiler (-koopa|-riscv) <input> -o <output>".to_string()
+        "usage: compiler (-koopa|-koopair|-riscv) <input> -o <output>".to_string()
     }
 }

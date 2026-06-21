@@ -1,3 +1,5 @@
+use crate::ast_to_ir;
+use crate::ir_to_koopa;
 use crate::koopa_gen;
 use crate::riscv_gen;
 
@@ -20,6 +22,10 @@ pub fn generate(program: &CompUnit, mode: OutputMode) -> CompilerResult<String> 
     match mode {
         OutputMode::Koopa => koopa_gen::KoopaGen::new().gen_program(program),
         OutputMode::Riscv => riscv_gen::RiscvGen::new().gen_program(program),
+        OutputMode::KoopaIr => {
+            let ir = ast_to_ir::AstToIr::new().gen_program(program)?;
+            Ok(ir_to_koopa::emit_koopa(&ir))
+        }
     }
 }
 
