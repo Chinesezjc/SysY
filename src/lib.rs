@@ -8,6 +8,7 @@ mod ir_builder;
 mod ir_to_koopa;
 mod koopa_gen;
 mod lexer;
+mod opt;
 mod parser;
 mod riscv_gen;
 mod ssa;
