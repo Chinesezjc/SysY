@@ -24,8 +24,11 @@ pub fn generate(program: &CompUnit, mode: OutputMode) -> CompilerResult<String> 
         OutputMode::Koopa => koopa_gen::KoopaGen::new().gen_program(program),
         OutputMode::Riscv => riscv_gen::RiscvGen::new().gen_program(program),
         OutputMode::KoopaIr => {
-            let ir = ast_to_ir::AstToIr::new().gen_program(program)?;
-            // TODO: run optimization passes (Mem2Reg, ConstFold, DCE, GVN) here
+            let mut ir = ast_to_ir::AstToIr::new().gen_program(program)?;
+            // Run optimization passes
+            for func in &mut ir.funcs {
+                ssa::mem2reg(func);
+            }
             Ok(ir_to_koopa::emit_koopa(&ir))
         }
     }
