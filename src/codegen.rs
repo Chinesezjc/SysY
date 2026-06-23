@@ -1,7 +1,7 @@
 use crate::ast_to_ir;
 use crate::ir_to_koopa;
 use crate::koopa_gen;
-use crate::opt::{self, IrFuncPass};
+use crate::opt::{self, IrFuncPass, IrProgramPass};
 use crate::riscv_gen;
 use crate::ssa;
 
@@ -26,17 +26,13 @@ pub fn generate(program: &CompUnit, mode: OutputMode) -> CompilerResult<String> 
         OutputMode::Riscv => riscv_gen::RiscvGen::new().gen_program(program),
         OutputMode::KoopaIr => {
             let mut ir = ast_to_ir::AstToIr::new().gen_program(program)?;
-            // Build optimization pipeline
+            // Optimization pipeline: Inline first, then Mem2Reg + ConstFold/DCE/GVN
+            opt::inline::Inline::new().run(&mut ir);
+            for func in &mut ir.funcs { ssa::mem2reg(func); }
             let mut pm = opt::PassManager::new();
-            // Mem2Reg first (expose more optimizations)
-            // ConstFold → DCE → GVN (iterate to fixed point)
             pm.add_func_pass(Box::new(opt::const_fold::ConstFold));
             pm.add_func_pass(Box::new(opt::dce::DeadCodeElim));
             pm.add_func_pass(Box::new(opt::gvn::GVN));
-            // Run mem2reg separately (it returns false for multi-block)
-            for func in &mut ir.funcs {
-                ssa::mem2reg(func);
-            }
             pm.run(&mut ir);
             Ok(ir_to_koopa::emit_koopa(&ir))
         }

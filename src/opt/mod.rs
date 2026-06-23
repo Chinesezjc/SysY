@@ -3,6 +3,7 @@
 pub mod const_fold;
 pub mod dce;
 pub mod gvn;
+pub mod inline;
 
 use crate::ir::*;
 
