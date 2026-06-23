@@ -54,6 +54,7 @@ impl CliArgs {
             "-koopa" => OutputMode::Koopa,
             "-riscv" => OutputMode::Riscv,
             "-koopair" => OutputMode::KoopaIr,
+            "-riscvir" => OutputMode::RiscvIr,
             _ => return Err(Self::usage()),
         };
 

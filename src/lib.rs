@@ -6,6 +6,7 @@ mod error;
 mod ir;
 mod ir_builder;
 mod ir_to_koopa;
+mod ir_to_riscv;
 mod koopa_gen;
 mod lexer;
 mod opt;
@@ -20,6 +21,7 @@ pub enum OutputMode {
     Koopa,
     Riscv,
     KoopaIr,
+    RiscvIr,
 }
 
 pub fn compile_source(source: &str, mode: OutputMode) -> CompilerResult<String> {
