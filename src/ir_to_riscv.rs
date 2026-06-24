@@ -32,9 +32,10 @@ fn emit_lw(emitter: &mut RvEmitter, rd: &str, offset: i32) {
     if offset >= -2048 && offset < 2048 {
         emitter.emit(&format!("  lw {rd}, {offset}(sp)"));
     } else {
-        emitter.emit(&format!("  li t0, {offset}"));
-        emitter.emit("  add t0, sp, t0");
-        emitter.emit(&format!("  lw {rd}, 0(t0)"));
+        // Use t3 as scratch to avoid clobbering t0/t1 which may hold live values
+        emitter.emit(&format!("  li t3, {offset}"));
+        emitter.emit("  add t3, sp, t3");
+        emitter.emit(&format!("  lw {rd}, 0(t3)"));
     }
 }
 
@@ -42,10 +43,10 @@ fn emit_sw(emitter: &mut RvEmitter, rs: &str, offset: i32) {
     if offset >= -2048 && offset < 2048 {
         emitter.emit(&format!("  sw {rs}, {offset}(sp)"));
     } else {
-        let scratch = if rs == "t0" { "t1" } else { "t0" };
-        emitter.emit(&format!("  li {scratch}, {offset}"));
-        emitter.emit(&format!("  add {scratch}, sp, {scratch}"));
-        emitter.emit(&format!("  sw {rs}, 0({scratch})"));
+        // Use t3 as scratch to avoid clobbering t0/t1 which may hold live values
+        emitter.emit(&format!("  li t3, {offset}"));
+        emitter.emit("  add t3, sp, t3");
+        emitter.emit(&format!("  sw {rs}, 0(t3)"));
     }
 }
 
@@ -53,8 +54,8 @@ fn emit_addi_sp(emitter: &mut RvEmitter, delta: i32) {
     if delta >= -2048 && delta < 2048 {
         emitter.emit(&format!("  addi sp, sp, {delta}"));
     } else {
-        emitter.emit(&format!("  li t0, {delta}"));
-        emitter.emit("  add sp, sp, t0");
+        emitter.emit(&format!("  li t3, {delta}"));
+        emitter.emit("  add sp, sp, t3");
     }
 }
 
@@ -73,8 +74,8 @@ fn emit_addr(emitter: &mut RvEmitter, rd: &str, offset: i32) {
     if offset >= -2048 && offset < 2048 {
         emitter.emit(&format!("  addi {rd}, sp, {offset}"));
     } else {
-        emitter.emit(&format!("  li {rd}, {offset}"));
-        emitter.emit(&format!("  add {rd}, sp, {rd}"));
+        emitter.emit(&format!("  li t3, {offset}"));
+        emitter.emit(&format!("  add {rd}, sp, t3"));
     }
 }
 
@@ -272,24 +273,36 @@ fn emit_inst(e: &mut RvEmitter, inst: &IrInst, frame: &FrameInfo, program: &IrPr
             let callee = program.func_name(*func).strip_prefix('@').unwrap_or(program.func_name(*func)).to_string();
             let n = args.len();
 
-            // Evaluate all args at original sp into a0, push immediately in reverse
-            // order. To avoid sp changes affecting subsequent evaluations, we first
-            // evaluate all args, spilling results to temporary slots at the end
-            // of the current frame. Then push them all at once.
+            // Evaluate each arg into a0 and push immediately in reverse order.
+            // Each evaluation happens BEFORE any sp change for that arg,
+            // but sp may have changed from previous pushes. For frame-accessing
+            // args, the sp change from previous pushes affects the offset.
+            // We avoid this by evaluating all args first into a0 and saving
+            // them to the call spill area, then pushing in reverse order.
 
-            // Temp slots: use call spill area within the frame.
-            // We save each arg value to sp+frame.call_spill_base + i*4, then
-            // in a second pass, push onto stack and pop into registers.
+            // Save args to call spill area (at original sp)
             let base = frame.call_spill_base;
             for (i, arg) in args.iter().enumerate() {
                 let val = op_to_reg(e, *arg, frame, program, "a0", param_regs, stack_param_offsets, param_spill);
                 if val != "a0" { e.emit(&format!("  mv a0, {val}")); }
                 let off = base + i as i32 * 4;
-                // Store to temp slot (above frame, at original sp)
                 emit_sw(e, "a0", off);
             }
 
-            // Now push all args in reverse order (arg0 ends up at sp+0)
+            // If n=1 and it fits in registers, skip the push/pop entirely
+            if n <= 8 && n > 0 {
+                // Just load directly into registers from spill area
+                let regs = ["a0","a1","a2","a3","a4","a5","a6","a7"];
+                for i in 0..n {
+                    let off = base + i as i32 * 4;
+                    emit_lw(e, regs[i], off);
+                }
+                e.emit(&format!("  call {callee}"));
+                if let Some(d) = dest { emit_sw(e, "a0", lo(*d)); }
+                return; // done — skip push/pop sequence
+            }
+
+            // For >8 args: push in reverse order, pop first 8
             let mut extra: i32 = 0;
             for i in (0..n).rev() {
                 let off = base + i as i32 * 4;
@@ -298,23 +311,17 @@ fn emit_inst(e: &mut RvEmitter, inst: &IrInst, frame: &FrameInfo, program: &IrPr
                 emit_lw(e, "t0", off + extra);
                 e.emit("  sw t0, 0(sp)");
             }
-
-            // Pop first 8 args into a0-a7 registers
             let reg_count = n.min(8);
             for i in 0..reg_count {
                 let reg = ["a0","a1","a2","a3","a4","a5","a6","a7"][i];
                 e.emit(&format!("  lw {reg}, 0(sp)"));
                 e.emit("  addi sp, sp, 4");
             }
-
             e.emit(&format!("  call {callee}"));
-
-            // Remove remaining stack args (params 8+)
             let stack_args = n.saturating_sub(8);
             if stack_args > 0 {
                 e.emit(&format!("  addi sp, sp, {}", (stack_args * 4) as i32));
             }
-
             if let Some(d) = dest { emit_sw(e, "a0", lo(*d)); }
         }
         IrInst::Br { cond, then_bb, else_bb } => {
