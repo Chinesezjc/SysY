@@ -294,7 +294,7 @@ fn format_inst(program: &IrProgram, inst: &IrInst) -> String {
                 op_str(*rhs)
             )
         }
-        IrInst::GetPtr { dest, ptr, index } => {
+        IrInst::GetPtr { dest, ptr, index, .. } => {
             format!(
                 "  {} = getptr {}, {}\n",
                 locals[*dest],
@@ -302,7 +302,7 @@ fn format_inst(program: &IrProgram, inst: &IrInst) -> String {
                 op_str(*index)
             )
         }
-        IrInst::GetElemPtr { dest, ptr, index } => {
+        IrInst::GetElemPtr { dest, ptr, index, .. } => {
             format!(
                 "  {} = getelemptr {}, {}\n",
                 locals[*dest],

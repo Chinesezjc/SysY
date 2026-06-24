@@ -17,7 +17,7 @@ use crate::ir_builder::*;
 enum IrSymbol {
     Const(i32),
     Var(usize),                   // global index of alloca
-    Array(usize, usize),          // global index + num dims
+    Array(usize, Vec<i32>),       // global index + dimension values
     PtrArray(usize),              // global index
     NdParam { name: usize, dims: Vec<i32> },
 }
@@ -133,7 +133,7 @@ impl AstToIr {
                         let array_type = make_array_type(&dims);
                         let init = self.global_init_vals(&dims, &def.init);
                         self.program.globals.push(IrGlobal { name: g_idx, ty: array_type, init });
-                        self.globals.insert(def.name.clone(), IrSymbol::Array(g_idx, dims.len()));
+                        self.globals.insert(def.name.clone(), IrSymbol::Array(g_idx, dims));
                     }
                 }
             }
@@ -158,7 +158,7 @@ impl AstToIr {
                             self.global_init_vals(&dims, e)
                         } else { IrGlobalInit::Zero };
                         self.program.globals.push(IrGlobal { name: g_idx, ty: array_type, init });
-                        self.globals.insert(def.name.clone(), IrSymbol::Array(g_idx, dims.len()));
+                        self.globals.insert(def.name.clone(), IrSymbol::Array(g_idx, dims));
                     }
                 }
             }
@@ -362,7 +362,7 @@ impl AstToIr {
                         let base_idx = self.b().intern_global(koopa_name);
                         self.b().add_pending_alloca(base_idx, array_type);
                         self.scopes.last_mut().unwrap()
-                            .insert(def.name.clone(), IrSymbol::Array(base_idx, dims.len()));
+                            .insert(def.name.clone(), IrSymbol::Array(base_idx, dims.clone()));
                         self.gen_array_init(base_idx, &dims, &def.init)?;
                     }
                 }
@@ -390,7 +390,7 @@ impl AstToIr {
                         let base_idx = self.b().intern_global(koopa_name);
                         self.b().add_pending_alloca(base_idx, array_type);
                         self.scopes.last_mut().unwrap()
-                            .insert(def.name.clone(), IrSymbol::Array(base_idx, dims.len()));
+                            .insert(def.name.clone(), IrSymbol::Array(base_idx, dims.clone()));
                         if let Some(init) = &def.init {
                             self.gen_array_init(base_idx, &dims, init)?;
                         }
@@ -497,10 +497,10 @@ impl AstToIr {
             Some((base, _is_ptr)) if is_ndparam => {
                 let val = self.gen_expr(expr)?;
                 let first = self.gen_expr(&indices[0])?;
-                let mut ptr = self.b().emit_getptr(IrOperand::Global(base), first);
+                let mut ptr = self.b().emit_getptr(IrOperand::Global(base), first, 4);
                 for idx in &indices[1..] {
                     let iv = self.gen_expr(idx)?;
-                    ptr = self.b().emit_getelemptr(ptr, iv);
+                    ptr = self.b().emit_getelemptr(ptr, iv, 4);
                 }
                 self.b().emit_store(val, ptr);
             }
@@ -509,8 +509,8 @@ impl AstToIr {
                 let mut ptr = IrOperand::Global(base);
                 for idx in indices {
                     let iv = self.gen_expr(idx)?;
-                    ptr = if is_ptr { self.b().emit_getptr(ptr, iv) }
-                          else { let p0 = self.b().emit_getelemptr(ptr, IrOperand::Int(0)); self.b().emit_getptr(p0, iv) };
+                    ptr = if is_ptr { self.b().emit_getptr(ptr, iv, 4) }
+                          else { let p0 = self.b().emit_getelemptr(ptr, IrOperand::Int(0), 4); self.b().emit_getptr(p0, iv, 4) };
                 }
                 self.b().emit_store(val, ptr);
             }
@@ -532,8 +532,11 @@ impl AstToIr {
             Expr::Index { array, index } => {
                 let idx_val = self.gen_expr(index.as_ref())?;
                 let base = self.gen_expr_base(array.as_ref())?;
-                let p0 = self.b().emit_getelemptr(base, IrOperand::Int(0));
-                Ok(self.b().emit_getptr(p0, idx_val))
+                // Compute the correct stride for this index level
+                let num_before = count_indices(array.as_ref());
+                let stride = self.get_stride_at(array.as_ref(), num_before);
+                let p0 = self.b().emit_getelemptr(base, IrOperand::Int(0), stride);
+                Ok(self.b().emit_getptr(p0, idx_val, stride))
             }
             _ => Err(CompilerError::new("not an lvalue")),
         }
@@ -578,16 +581,23 @@ impl AstToIr {
         indices.reverse();
         let total_dims = 1 + dims.len();
 
+        // Compute stride for the first getptr: product of all fixed dims * 4
+        let first_stride: i32 = if dims.is_empty() { 4 } else { dims.iter().product::<i32>().max(1) * 4 };
+
         let first_idx = self.gen_expr(indices[0])?;
-        let mut ptr = self.b().emit_getptr(IrOperand::Global(base_name), first_idx);
-        for idx in &indices[1..] {
+        let mut ptr = self.b().emit_getptr(IrOperand::Global(base_name), first_idx, first_stride);
+        for (di, idx) in indices[1..].iter().enumerate() {
             let idx_val = self.gen_expr(idx)?;
-            ptr = self.b().emit_getelemptr(ptr, idx_val);
+            // Stride for fixed dimension di: product of dims[di+1..] * 4
+            let fixed_stride: i32 = if di + 1 < dims.len() {
+                dims[di+1..].iter().product::<i32>().max(1) * 4
+            } else { 4 };
+            ptr = self.b().emit_getelemptr(ptr, idx_val, fixed_stride);
         }
         if indices.len() >= total_dims {
             Ok(self.b().emit_load(ptr))
         } else {
-            Ok(self.b().emit_getelemptr(ptr, IrOperand::Int(0)))
+            Ok(self.b().emit_getelemptr(ptr, IrOperand::Int(0), 4))
         }
     }
 
@@ -641,7 +651,7 @@ impl AstToIr {
                 match sym {
                     Some(IrSymbol::Const(v)) => Ok(IrOperand::Int(v)),
                     Some(IrSymbol::Var(koopa_idx)) => Ok(self.b().emit_load(IrOperand::Global(koopa_idx))),
-                    Some(IrSymbol::Array(n, _)) => Ok(self.b().emit_getelemptr(IrOperand::Global(n), IrOperand::Int(0))),
+                    Some(IrSymbol::Array(n, _)) => Ok(self.b().emit_getelemptr(IrOperand::Global(n), IrOperand::Int(0), 4)),
                     Some(IrSymbol::PtrArray(n)) => Ok(IrOperand::Global(n)),
                     Some(IrSymbol::NdParam { name, .. }) => Ok(IrOperand::Global(name)),
                     None => Err(CompilerError::new(format!("undefined identifier '{name}'"))),
@@ -735,18 +745,21 @@ impl AstToIr {
                 };
                 let idx_val = self.gen_expr(index)?;
                 let base = self.gen_expr_base(array)?;
+                // Compute stride for this index level
+                let num_before = count_indices(array);
+                let stride = self.get_stride_at(array, num_before);
                 let elem_ptr = if is_ptr {
-                    self.b().emit_getptr(base, idx_val)
+                    self.b().emit_getptr(base, idx_val, stride)
                 } else {
-                    let p0 = self.b().emit_getelemptr(base, IrOperand::Int(0));
-                    self.b().emit_getptr(p0, idx_val)
+                    let p0 = self.b().emit_getelemptr(base, IrOperand::Int(0), stride);
+                    self.b().emit_getptr(p0, idx_val, stride)
                 };
                 let num_indices = 1 + count_indices(array);
                 let total_dims = self.get_total_dims_for(array);
                 if num_indices >= total_dims {
                     Ok(self.b().emit_load(elem_ptr))
                 } else {
-                    Ok(self.b().emit_getelemptr(elem_ptr, IrOperand::Int(0)))
+                    Ok(self.b().emit_getelemptr(elem_ptr, IrOperand::Int(0), 4))
                 }
             }
             Expr::InitList(_) => Err(CompilerError::new("init list not allowed here")),
@@ -779,25 +792,25 @@ impl AstToIr {
                         // NdParam: just getptr for the dynamic index. Fixed dims
                         // are handled by nested Index handlers (getelemptr+getptr).
                         let iv = self.gen_expr(index)?;
-                        let elem_ptr = self.b().emit_getptr(IrOperand::Global(base), iv);
+                        let elem_ptr = self.b().emit_getptr(IrOperand::Global(base), iv, 4);
                         if num_indices >= total_dims {
                             Ok(self.b().emit_load(elem_ptr))
                         } else {
-                            Ok(self.b().emit_getelemptr(elem_ptr, IrOperand::Int(0)))
+                            Ok(self.b().emit_getelemptr(elem_ptr, IrOperand::Int(0), 4))
                         }
                     }
                     Some((base, is_ptr, _)) => {
                         let iv = self.gen_expr(index)?;
                         let elem_ptr = if is_ptr {
-                            self.b().emit_getptr(IrOperand::Global(base), iv)
+                            self.b().emit_getptr(IrOperand::Global(base), iv, 4)
                         } else {
-                            let p0 = self.b().emit_getelemptr(IrOperand::Global(base), IrOperand::Int(0));
-                            self.b().emit_getptr(p0, iv)
+                            let p0 = self.b().emit_getelemptr(IrOperand::Global(base), IrOperand::Int(0), 4);
+                            self.b().emit_getptr(p0, iv, 4)
                         };
                         if num_indices >= total_dims {
                             Ok(self.b().emit_load(elem_ptr))
                         } else {
-                            Ok(self.b().emit_getelemptr(elem_ptr, IrOperand::Int(0)))
+                            Ok(self.b().emit_getelemptr(elem_ptr, IrOperand::Int(0), 4))
                         }
                     }
                     None => Err(CompilerError::new(format!("'{name}' is not an array"))),
@@ -807,12 +820,12 @@ impl AstToIr {
                 let base_ptr = self.gen_index_expr(inner.as_ref(), inner_idx.as_ref())?;
                 let iv = self.gen_expr(index)?;
                 // Each non-NdParam dim: getelemptr→decay, then getptr→index
-                let decay = self.b().emit_getelemptr(base_ptr, IrOperand::Int(0));
-                let elem_ptr = self.b().emit_getptr(decay, iv);
+                let decay = self.b().emit_getelemptr(base_ptr, IrOperand::Int(0), 4);
+                let elem_ptr = self.b().emit_getptr(decay, iv, 4);
                 if num_indices >= total_dims {
                     Ok(self.b().emit_load(elem_ptr))
                 } else {
-                    Ok(self.b().emit_getelemptr(elem_ptr, IrOperand::Int(0)))
+                    Ok(self.b().emit_getelemptr(elem_ptr, IrOperand::Int(0), 4))
                 }
             }
             _ => Err(CompilerError::new("invalid array access")),
@@ -919,17 +932,17 @@ impl AstToIr {
             return IrOperand::Global(base_idx);
         }
         // First: getelemptr @base, 0 — get pointer to first element of outer array
-        let mut ptr = self.b().emit_getelemptr(IrOperand::Global(base_idx), IrOperand::Int(0));
+        let mut ptr = self.b().emit_getelemptr(IrOperand::Global(base_idx), IrOperand::Int(0), 4);
         // For each dimension (except the innermost), we need another getelemptr to
         // go inside. The innermost dimension elements are i32, so we just need
         // getptr to offset within that inner array.
         // Actually: for an array [T, N], getelemptr gives *T. If T is still an array,
         // we need getelemptr again. If T is i32, we use getptr for the offset.
         for _ in 1..dims.len() {
-            ptr = self.b().emit_getelemptr(ptr, IrOperand::Int(0));
+            ptr = self.b().emit_getelemptr(ptr, IrOperand::Int(0), 4);
         }
         // Now ptr is *i32. Use getptr to offset by flat_idx.
-        self.b().emit_getptr(ptr, IrOperand::Int(flat_idx))
+        self.b().emit_getptr(ptr, IrOperand::Int(flat_idx), 4)
     }
 }
 
@@ -944,13 +957,55 @@ impl AstToIr {
     fn get_total_dims_for(&self, expr: &Expr) -> usize {
         match expr {
             Expr::LVal(name) => match self.lookup(name) {
-                Some(IrSymbol::Array(_, ndims)) => *ndims,
+                Some(IrSymbol::Array(_, dims)) => dims.len(),
                 Some(IrSymbol::PtrArray(_)) => 1,
                 Some(IrSymbol::NdParam { dims, .. }) => 1 + dims.len(),
                 _ => 1,
             },
             Expr::Index { array, .. } => self.get_total_dims_for(array.as_ref()),
             _ => 1,
+        }
+    }
+
+    /// Compute the byte stride for the current index level.
+    /// For array `int[D0][D1]...[Dk]`, at index position `pos` (0-indexed),
+    /// returns product(D_{pos+1} ... D_k) * 4, or 4 for the last dimension.
+    fn get_stride_at(&self, expr: &Expr, num_indices_applied: usize) -> i32 {
+        let total_dims = self.get_total_dims_for(expr);
+        let remaining = total_dims.saturating_sub(num_indices_applied);
+        if remaining <= 1 { return 4; }
+        // Walk to base LVal to get dimension values
+        let mut cur = expr;
+        loop {
+            match cur {
+                Expr::Index { array, .. } => cur = array.as_ref(),
+                Expr::LVal(name) => {
+                    return match self.lookup(name) {
+                        Some(IrSymbol::Array(_, dims)) => {
+                            let start = dims.len().saturating_sub(remaining - 1);
+                            let prod: i32 = dims[start..].iter().product();
+                            (prod * 4).max(4)
+                        }
+                        Some(IrSymbol::NdParam { dims, .. }) => {
+                            // NdParam: total dims = 1 (dynamic) + fixed_dims.len()
+                            // start is 0-indexed into [dynamic, fixed0, fixed1, ...]
+                            let total = 1 + dims.len();
+                            let start = total.saturating_sub(remaining - 1);
+                            if start == 0 {
+                                // First dimension is dynamic, stride = product of all fixed dims * 4
+                                if dims.is_empty() { 4 } else { dims.iter().product::<i32>().max(1) * 4 }
+                            } else {
+                                // Fixed dimension: stride = product of remaining fixed dims * 4
+                                let fi = start - 1; // index into fixed dims
+                                if fi >= dims.len() { 4 }
+                                else { dims[fi..].iter().product::<i32>().max(1) * 4 }
+                            }
+                        }
+                        _ => 4,
+                    };
+                }
+                _ => return 4,
+            }
         }
     }
 }

@@ -145,13 +145,16 @@ pub enum IrInst {
         dest: usize,
         ptr: IrOperand,
         index: IrOperand,
+        elem_size: i32,
     },
 
     /// `dest = getelemptr ptr, index`  — element pointer from array
+    /// `elem_size` is the byte size of the element type (for non-power-of-2 strides).
     GetElemPtr {
         dest: usize,
         ptr: IrOperand,
         index: IrOperand,
+        elem_size: i32,
     },
 
     /// `dest = call @func(args)`

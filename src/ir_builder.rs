@@ -212,15 +212,15 @@ impl IrBuilder {
         IrOperand::Local(dest)
     }
 
-    pub fn emit_getptr(&mut self, ptr: IrOperand, index: IrOperand) -> IrOperand {
+    pub fn emit_getptr(&mut self, ptr: IrOperand, index: IrOperand, elem_size: i32) -> IrOperand {
         let dest = self.alloc_tmp();
-        self.push(IrInst::GetPtr { dest, ptr, index });
+        self.push(IrInst::GetPtr { dest, ptr, index, elem_size });
         IrOperand::Local(dest)
     }
 
-    pub fn emit_getelemptr(&mut self, ptr: IrOperand, index: IrOperand) -> IrOperand {
+    pub fn emit_getelemptr(&mut self, ptr: IrOperand, index: IrOperand, elem_size: i32) -> IrOperand {
         let dest = self.alloc_tmp();
-        self.push(IrInst::GetElemPtr { dest, ptr, index });
+        self.push(IrInst::GetElemPtr { dest, ptr, index, elem_size });
         IrOperand::Local(dest)
     }
 
