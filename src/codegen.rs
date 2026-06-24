@@ -1,9 +1,8 @@
 use crate::ast_to_ir;
+use crate::ir::IrProgram;
 use crate::ir_to_koopa;
 use crate::ir_to_riscv;
-use crate::koopa_gen;
 use crate::opt::{self, IrFuncPass, IrProgramPass};
-use crate::riscv_gen;
 use crate::ssa;
 
 use crate::OutputMode;
@@ -21,30 +20,27 @@ pub(crate) const LIB_FUNCS: &[(&str, Type, &[&str])] = &[
     ("stoptime", Type::Void, &[]),
 ];
 
+/// AST → optimized IR (shared by all new-pipeline backends).
+fn compile_to_ir(program: &CompUnit) -> CompilerResult<IrProgram> {
+    let mut ir = ast_to_ir::AstToIr::new().gen_program(program)?;
+    opt::inline::Inline::new().run(&mut ir);
+    for func in &mut ir.funcs { ssa::mem2reg(func); }
+    let mut pm = opt::PassManager::new();
+    pm.add_func_pass(Box::new(opt::const_fold::ConstFold));
+    pm.add_func_pass(Box::new(opt::dce::DeadCodeElim));
+    pm.add_func_pass(Box::new(opt::gvn::GVN));
+    pm.run(&mut ir);
+    Ok(ir)
+}
+
 pub fn generate(program: &CompUnit, mode: OutputMode) -> CompilerResult<String> {
     match mode {
-        OutputMode::Koopa => koopa_gen::KoopaGen::new().gen_program(program),
-        OutputMode::Riscv => riscv_gen::RiscvGen::new().gen_program(program),
-        OutputMode::KoopaIr => {
-            let mut ir = ast_to_ir::AstToIr::new().gen_program(program)?;
-            opt::inline::Inline::new().run(&mut ir);
-            for func in &mut ir.funcs { ssa::mem2reg(func); }
-            let mut pm = opt::PassManager::new();
-            pm.add_func_pass(Box::new(opt::const_fold::ConstFold));
-            pm.add_func_pass(Box::new(opt::dce::DeadCodeElim));
-            pm.add_func_pass(Box::new(opt::gvn::GVN));
-            pm.run(&mut ir);
+        OutputMode::Koopa | OutputMode::KoopaIr => {
+            let ir = compile_to_ir(program)?;
             Ok(ir_to_koopa::emit_koopa(&ir))
         }
-        OutputMode::RiscvIr => {
-            let mut ir = ast_to_ir::AstToIr::new().gen_program(program)?;
-            opt::inline::Inline::new().run(&mut ir);
-            for func in &mut ir.funcs { ssa::mem2reg(func); }
-            let mut pm = opt::PassManager::new();
-            pm.add_func_pass(Box::new(opt::const_fold::ConstFold));
-            pm.add_func_pass(Box::new(opt::dce::DeadCodeElim));
-            pm.add_func_pass(Box::new(opt::gvn::GVN));
-            pm.run(&mut ir);
+        OutputMode::Riscv | OutputMode::RiscvIr => {
+            let ir = compile_to_ir(program)?;
             Ok(ir_to_riscv::emit_riscv(&ir))
         }
     }
