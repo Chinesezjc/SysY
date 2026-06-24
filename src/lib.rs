@@ -12,12 +12,6 @@ mod opt;
 mod parser;
 mod ssa;
 
-// ── Legacy backends (replaced by the IR pipeline, kept for reference) ─────────
-#[allow(dead_code)]
-mod koopa_gen;
-#[allow(dead_code)]
-mod riscv_gen;
-
 pub use error::{CompilerError, CompilerResult};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

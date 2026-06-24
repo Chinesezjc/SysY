@@ -1,7 +1,7 @@
 //! AST → in-memory IR translation.
 //!
-//! Mirrors the logic of [`crate::koopa_gen`] but produces an [`IrProgram`]
-//! instead of Koopa IR text.
+//! Translates the SysY AST into our self-built [`IrProgram`],
+//! which is then optimized and lowered to Koopa IR or RISC-V assembly.
 
 use std::collections::{HashMap, HashSet};
 
@@ -193,7 +193,7 @@ impl AstToIr {
         for param in &func.params {
             if param.is_array {
                 if self.globals.contains_key(&param.name) { self.mangle(&param.name); }
-                // Array params: sig_name == koopa_name (single mangle call, matching koopa_gen.rs)
+                // Array params: sig_name == koopa_name (single mangle call)
                 let koopa_name = self.mangle(&param.name);
                 let koopa_idx = self.b().intern_global(koopa_name.clone());
                 self.param_sig_names.insert(param.name.clone(), koopa_idx);
@@ -223,7 +223,7 @@ impl AstToIr {
             }
         }
 
-        // First pass: find lib calls in body (like koopa_gen's gen_block_for_lib_decls)
+        // First pass: find lib calls in body
         self.emit_lib_decls_for_body(&func.body)?;
 
         // Generate body
@@ -556,7 +556,7 @@ impl AstToIr {
     }
 
     fn gen_ndparam_index_full(&mut self, expr: &Expr) -> CompilerResult<IrOperand> {
-        // Flatten all nested indices, reverse, and handle like koopa_gen's gen_ndparam_index
+        // Flatten all nested indices, reverse, and handle NdParam indexing
         let mut indices: Vec<&Expr> = Vec::new();
         let mut cur = expr;
         let base_name;
