@@ -248,8 +248,16 @@ impl IrBuilder {
         IrOperand::Local(dest)
     }
 
+    /// Emit inline assembly as a statement (no return value).
     pub fn emit_asm(&mut self, raw: String) {
-        self.push(IrInst::Asm(raw));
+        self.push(IrInst::Asm { dest: None, code: raw });
+    }
+
+    /// Emit inline assembly as an expression (result in a0, assigned to temp).
+    pub fn emit_asm_expr(&mut self, raw: String) -> IrOperand {
+        let dest = self.alloc_tmp();
+        self.push(IrInst::Asm { dest: Some(dest), code: raw });
+        IrOperand::Local(dest)
     }
 
     // ── Pending allocas ──────────────────────────────────────────────────────

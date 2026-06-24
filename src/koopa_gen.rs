@@ -799,6 +799,7 @@ impl KoopaGen {
                 self.block_terminated = true;
             }
             Stmt::Empty => {}
+            Stmt::Asm(_) => return Err(CompilerError::new("inline asm is not supported in Koopa IR output")),
         }
         Ok(())
     }
@@ -851,6 +852,9 @@ impl KoopaGen {
             )),
             Expr::InitList(_) => Err(CompilerError::new(
                 "initializer list is not a compile-time constant",
+            )),
+            Expr::Asm(_) => Err(CompilerError::new(
+                "inline asm is not a compile-time constant",
             )),
         }
     }
@@ -1066,6 +1070,7 @@ impl KoopaGen {
                     Ok(tmp)
                 }
             }
+            Expr::Asm(_) => Err(CompilerError::new("inline asm is not supported in Koopa IR output")),
         }
     }
 

@@ -74,6 +74,7 @@ pub enum Stmt {
     Return(Option<Expr>),
     Assign { name: String, index: Vec<Expr>, expr: Expr },
     Expr(Expr),
+    Asm(String),
     Block(Block),
     If {
         cond: Expr,
@@ -111,6 +112,7 @@ pub enum Expr {
         index: Box<Expr>,
     },
     InitList(Vec<Expr>),
+    Asm(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

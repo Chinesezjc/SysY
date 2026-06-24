@@ -188,7 +188,10 @@ pub enum IrInst {
     },
 
     /// Inline assembly — raw string embedded verbatim in RISC-V output.
-    Asm(String),
+    Asm {
+        dest: Option<usize>,
+        code: String,
+    },
 }
 
 impl IrInst {
@@ -211,8 +214,8 @@ impl IrInst {
             IrInst::Store { .. }
             | IrInst::Br { .. }
             | IrInst::Jump { .. }
-            | IrInst::Ret { .. }
-            | IrInst::Asm(_) => None,
+            | IrInst::Ret { .. } => None,
+            IrInst::Asm { dest, .. } => *dest,
         }
     }
 
@@ -230,8 +233,8 @@ impl IrInst {
             IrInst::Store { .. }
             | IrInst::Br { .. }
             | IrInst::Jump { .. }
-            | IrInst::Ret { .. }
-            | IrInst::Asm(_) => None,
+            | IrInst::Ret { .. } => None,
+            IrInst::Asm { dest, .. } => dest.as_mut(),
         }
     }
 
@@ -248,7 +251,7 @@ impl IrInst {
             IrInst::Br { cond, .. } => vec![cond],
             IrInst::Ret { value } => value.iter().collect(),
             IrInst::Phi { incoming, .. } => incoming.iter().map(|(v, _)| v).collect(),
-            IrInst::Alloc { .. } | IrInst::Jump { .. } | IrInst::Asm(_) => vec![],
+            IrInst::Alloc { .. } | IrInst::Jump { .. } | IrInst::Asm { .. } => vec![],
         }
     }
 }

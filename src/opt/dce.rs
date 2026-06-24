@@ -69,6 +69,6 @@ fn is_critical(inst: &IrInst) -> bool {
             | IrInst::Br { .. }
             | IrInst::Jump { .. }
             | IrInst::Ret { .. }
-            | IrInst::Asm(_)
+            | IrInst::Asm { .. }
     )
 }

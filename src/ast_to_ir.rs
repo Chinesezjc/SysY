@@ -480,6 +480,7 @@ impl AstToIr {
                 self.b().emit_jump(cl.0);
             }
             Stmt::Empty => {}
+            Stmt::Asm(s) => { self.b().emit_asm(s.clone()); }
         }
         Ok(())
     }
@@ -763,6 +764,7 @@ impl AstToIr {
                 }
             }
             Expr::InitList(_) => Err(CompilerError::new("init list not allowed here")),
+            Expr::Asm(s) => Ok(self.b().emit_asm_expr(s.clone())),
         }
     }
 

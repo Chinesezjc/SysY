@@ -244,6 +244,14 @@ impl Parser {
                 self.expect_semicolon()?;
                 Ok(Stmt::Continue)
             }
+            TokenKind::KwAsm => {
+                self.advance();
+                self.expect_l_paren()?;
+                let s = self.expect_string_literal()?;
+                self.expect_r_paren()?;
+                self.expect_semicolon()?;
+                Ok(Stmt::Asm(s))
+            }
             TokenKind::Ident(_) => {
                 // Parse LVal: name with optional [index] suffixes
                 let name = self.expect_ident()?;
@@ -590,6 +598,13 @@ impl Parser {
                 self.advance();
                 Expr::Int(value)
             }
+            TokenKind::KwAsm => {
+                self.advance();
+                self.expect_l_paren()?;
+                let s = self.expect_string_literal()?;
+                self.expect_r_paren()?;
+                Expr::Asm(s)
+            }
             TokenKind::Ident(name) => {
                 let name = name.clone();
                 self.advance();
@@ -700,6 +715,20 @@ impl Parser {
             _ => Err(CompilerError::at(
                 self.current().position,
                 "expected identifier",
+            )),
+        }
+    }
+
+    fn expect_string_literal(&mut self) -> CompilerResult<String> {
+        match self.current_kind() {
+            TokenKind::StringLiteral(s) => {
+                let s = s.clone();
+                self.advance();
+                Ok(s)
+            }
+            _ => Err(CompilerError::at(
+                self.current().position,
+                "expected string literal",
             )),
         }
     }

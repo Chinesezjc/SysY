@@ -825,6 +825,7 @@ impl RiscvGen {
                 self.emit(&format!("j {label}"));
             }
             Stmt::Empty => {}
+            Stmt::Asm(s) => { self.emit(s); }
         }
         Ok(())
     }
@@ -914,6 +915,9 @@ impl RiscvGen {
             }
             Expr::InitList(_) => Err(CompilerError::new(
                 "initializer list is not a compile-time constant",
+            )),
+            Expr::Asm(_) => Err(CompilerError::new(
+                "inline asm is not a compile-time constant",
             )),
         }
     }
@@ -1168,6 +1172,7 @@ impl RiscvGen {
                     self.extra_sp -= delta;
                 }
             }
+            Expr::Asm(s) => { self.emit(s); }
         }
         Ok(())
     }

@@ -340,7 +340,13 @@ fn emit_inst(e: &mut RvEmitter, inst: &IrInst, frame: &FrameInfo, program: &IrPr
             e.emit("  ret");
         }
         IrInst::Phi { .. } => e.emit("  # phi"),
-        IrInst::Asm(s) => e.emit(&format!("  {s}")),
+        IrInst::Asm { dest, code } => {
+            e.emit(&format!("  {code}"));
+            // If expression asm, result is in a0 — store to dest slot
+            if let Some(d) = dest {
+                emit_sw(e, "a0", lo(*d));
+            }
+        }
     }
 }
 

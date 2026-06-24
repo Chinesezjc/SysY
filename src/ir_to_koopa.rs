@@ -351,8 +351,8 @@ fn format_inst(program: &IrProgram, inst: &IrInst) -> String {
             // Phis should have been lowered; if any remain, emit a comment.
             "  // phi (unexpected)\n".to_string()
         }
-        IrInst::Asm(s) => {
-            format!("  // asm(\"{s}\")  ; not supported in Koopa IR\n")
+        IrInst::Asm { code, .. } => {
+            format!("  // asm(\"{code}\")  ; not supported in Koopa IR\n")
         }
     }
 }

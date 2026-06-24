@@ -17,10 +17,12 @@ pub enum TokenKind {
     KwBreak,
     KwContinue,
     KwVoid,
+    KwAsm,
     LBracket,
     RBracket,
     Ident(String),
     IntLiteral(i32),
+    StringLiteral(String),
     LParen,
     RParen,
     LBrace,
@@ -182,6 +184,7 @@ impl<'a> Lexer<'a> {
                     return Err(CompilerError::at(position, "unexpected '|'"));
                 }
             }
+            Some(b'"') => self.lex_string(position)?,
             Some(byte) if is_ident_start(byte) => self.lex_ident_or_keyword(position),
             Some(byte) if byte.is_ascii_digit() => self.lex_number(position)?,
             Some(byte) => {
@@ -237,6 +240,36 @@ impl<'a> Lexer<'a> {
         Ok(())
     }
 
+    fn lex_string(&mut self, start: usize) -> CompilerResult<TokenKind> {
+        self.bump(); // skip opening '"'
+        let mut s = String::new();
+        loop {
+            match self.peek() {
+                None => return Err(CompilerError::at(start, "unterminated string literal")),
+                Some(b'"') => {
+                    self.bump();
+                    break;
+                }
+                Some(b'\\') => {
+                    self.bump();
+                    match self.peek() {
+                        Some(b'n') => { self.bump(); s.push('\n'); }
+                        Some(b't') => { self.bump(); s.push('\t'); }
+                        Some(b'\\') => { self.bump(); s.push('\\'); }
+                        Some(b'"') => { self.bump(); s.push('"'); }
+                        Some(c) => return Err(CompilerError::at(self.position, format!("unknown escape '\\{}'", c as char))),
+                        None => return Err(CompilerError::at(start, "unterminated string literal")),
+                    }
+                }
+                Some(byte) => {
+                    s.push(byte as char);
+                    self.bump();
+                }
+            }
+        }
+        Ok(TokenKind::StringLiteral(s))
+    }
+
     fn lex_ident_or_keyword(&mut self, start: usize) -> TokenKind {
         while matches!(self.peek(), Some(byte) if is_ident_continue(byte)) {
             self.bump();
@@ -252,6 +285,7 @@ impl<'a> Lexer<'a> {
             "break" => TokenKind::KwBreak,
             "continue" => TokenKind::KwContinue,
             "void" => TokenKind::KwVoid,
+            "asm" => TokenKind::KwAsm,
             ident => TokenKind::Ident(ident.to_string()),
         }
     }
