@@ -11,7 +11,7 @@ use std::collections::HashMap;
 /// Manages a pool of allocatable RISC-V registers for local temporaries.
 pub(crate) struct RegTracker {
     /// local index → (register, dirty?)
-    locals: HashMap<usize, (String, bool)>,
+    pub locals: HashMap<usize, (String, bool)>,
     /// register → local index
     reg_to_local: HashMap<String, usize>,
     /// Available registers in preference order
@@ -74,25 +74,28 @@ impl RegTracker {
         self.locals.get(&local).map(|(r, _)| r.clone())
     }
 
-    /// Allocate a free register.  With live-interval information, most
-    /// allocations succeed without eviction.
-    pub fn alloc(&mut self) -> String {
+    /// Allocate a free register. If all are occupied, evicts the one whose
+    /// local dies farthest in the future. Returns (register, Option<evicted_local>).
+    /// The caller must spill the evicted local if it was dirty.
+    pub fn alloc(&mut self) -> (String, Option<usize>) {
         for reg in &self.pool {
             if !self.reg_to_local.contains_key(reg) {
-                return reg.clone();
+                return (reg.clone(), None);
             }
         }
-        // All pool registers occupied — evict the one whose local dies last
-        // (farthest next use = least urgent to keep in register).
-        let evict = self.pool.iter()
+        // All occupied — evict the one with farthest next use
+        let evict_reg = self.pool.iter()
             .filter_map(|r| self.reg_to_local.get(r).map(|&l| (r.clone(), l)))
             .max_by_key(|(_, l)| self.last_use.get(l).copied().unwrap_or(usize::MAX))
             .map(|(r, _)| r)
             .unwrap_or_else(|| self.pool.last().unwrap().clone());
-        if let Some(local) = self.reg_to_local.remove(&evict) {
+        let evicted = self.reg_to_local.remove(&evict_reg);
+        if let Some(local) = evicted {
             self.locals.remove(&local);
+            (evict_reg, Some(local))
+        } else {
+            (evict_reg, None)
         }
-        evict
     }
 
     /// Record that `local` is now held in `reg`, and is dirty.
