@@ -125,11 +125,19 @@ fn emit_function(e: &mut RvEmitter, func: &IrFunc, program: &IrProgram) {
     let fn_name = program.func_name(func.name).strip_prefix('@').unwrap_or(program.func_name(func.name));
     e.emit(&format!("  .globl {fn_name}")); e.emit_label(fn_name);
 
+    // Build param register map: global index → a0-a7 register name
+    let mut param_regs: HashMap<usize, String> = HashMap::new();
+    for (i, (pn, _)) in func.params.iter().enumerate() {
+        if i < 8 {
+            param_regs.insert(*pn, format!("a{}", i));
+        }
+    }
+
     // Prologue
     emit_addi_sp(e, -tf);
     emit_sw(e, "ra", frame.ra_offset);
 
-    // Store params
+    // Store params to their stack slots
     for (i, (pn, _)) in func.params.iter().enumerate() {
         let reg = match i { 0=>"a0",1=>"a1",2=>"a2",3=>"a3",4=>"a4",5=>"a5",6=>"a6",7=>"a7", _=>continue };
         if let Some(&off) = frame.alloca_offsets.get(pn) { emit_sw(e, reg, off); }
@@ -143,7 +151,7 @@ fn emit_function(e: &mut RvEmitter, func: &IrFunc, program: &IrProgram) {
     // Emit blocks
     for block in &func.blocks {
         e.emit_label(&block_labels[&block.label]);
-        for inst in &block.instrs { emit_inst(e, inst, &frame, program, &block_labels); }
+        for inst in &block.instrs { emit_inst(e, inst, &frame, program, &block_labels, &param_regs); }
     }
 
     // Fallback epilogue
@@ -156,34 +164,32 @@ fn emit_function(e: &mut RvEmitter, func: &IrFunc, program: &IrProgram) {
     }
 }
 
-fn emit_inst(e: &mut RvEmitter, inst: &IrInst, frame: &FrameInfo, program: &IrProgram, block_labels: &HashMap<usize, String>) {
+fn emit_inst(e: &mut RvEmitter, inst: &IrInst, frame: &FrameInfo, program: &IrProgram, block_labels: &HashMap<usize, String>, param_regs: &HashMap<usize, String>) {
     let lo = |i: usize| frame.local_offsets.get(&i).copied().unwrap_or(0);
-    let ao = |i: usize| frame.alloca_offsets.get(&i).copied();
-    let glbl = |i: usize| program.global_name(i).strip_prefix('@').unwrap_or(program.global_name(i)).to_string();
 
     match inst {
         IrInst::Alloc { .. } => {}
 
         IrInst::Load { dest, src } => {
-            let addr = op_to_reg(e, *src, frame, program, "t2");
+            let addr = op_to_reg(e, *src, frame, program, "t2", param_regs);
             e.emit(&format!("  lw t0, 0({addr})"));
             emit_sw(e, "t0", lo(*dest));
         }
         IrInst::Store { value, ptr } => {
-            let val = op_to_reg(e, *value, frame, program, "t1");
-            let p = op_to_reg(e, *ptr, frame, program, "t2");
+            let val = op_to_reg(e, *value, frame, program, "t1", param_regs);
+            let p = op_to_reg(e, *ptr, frame, program, "t2", param_regs);
             e.emit(&format!("  sw {val}, 0({p})"));
         }
         IrInst::Arith { dest, op, lhs, rhs } => {
-            let lv = op_to_reg(e, *lhs, frame, program, "t0");
-            let rv = op_to_reg(e, *rhs, frame, program, "t1");
+            let lv = op_to_reg(e, *lhs, frame, program, "t0", param_regs);
+            let rv = op_to_reg(e, *rhs, frame, program, "t1", param_regs);
             let ins = match op { IrArithOp::Add=>"add", IrArithOp::Sub=>"sub", IrArithOp::Mul=>"mul", IrArithOp::Div=>"div", IrArithOp::Mod=>"rem" };
             e.emit(&format!("  {ins} a0, {lv}, {rv}"));
             emit_sw(e, "a0", lo(*dest));
         }
         IrInst::Icmp { dest, op, lhs, rhs } => {
-            let lv = op_to_reg(e, *lhs, frame, program, "t0");
-            let rv = op_to_reg(e, *rhs, frame, program, "t1");
+            let lv = op_to_reg(e, *lhs, frame, program, "t0", param_regs);
+            let rv = op_to_reg(e, *rhs, frame, program, "t1", param_regs);
             match op {
                 IrCmpOp::Lt => e.emit(&format!("  slt a0, {lv}, {rv}")),
                 IrCmpOp::Gt => e.emit(&format!("  slt a0, {rv}, {lv}")),
@@ -195,25 +201,25 @@ fn emit_inst(e: &mut RvEmitter, inst: &IrInst, frame: &FrameInfo, program: &IrPr
             emit_sw(e, "a0", lo(*dest));
         }
         IrInst::GetPtr { dest, ptr, index } => {
-            let base = op_to_reg(e, *ptr, frame, program, "t0");
-            let idx = op_to_reg(e, *index, frame, program, "t1");
+            let base = op_to_reg(e, *ptr, frame, program, "t0", param_regs);
+            let idx = op_to_reg(e, *index, frame, program, "t1", param_regs);
             e.emit(&format!("  slli t1, {idx}, 2"));
             e.emit(&format!("  add t0, {base}, t1"));
             emit_sw(e, "t0", lo(*dest));
         }
         IrInst::GetElemPtr { dest, ptr, index } => {
-            let base = op_to_reg(e, *ptr, frame, program, "t0");
-            let idx = op_to_reg(e, *index, frame, program, "t1");
+            let base = op_to_reg(e, *ptr, frame, program, "t0", param_regs);
+            let idx = op_to_reg(e, *index, frame, program, "t1", param_regs);
             e.emit(&format!("  slli t1, {idx}, 2"));
             e.emit(&format!("  add t0, {base}, t1"));
             emit_sw(e, "t0", lo(*dest));
         }
         IrInst::Call { dest, func, args } => {
-            let callee = glbl(*func);
+            let callee = program.func_name(*func).strip_prefix('@').unwrap_or(program.func_name(*func)).to_string();
             for (i, arg) in args.iter().enumerate() {
                 if i < 8 {
                     let areg = ["a0","a1","a2","a3","a4","a5","a6","a7"][i];
-                    let val = op_to_reg(e, *arg, frame, program, "t3");
+                    let val = op_to_reg(e, *arg, frame, program, "t3", param_regs);
                     e.emit(&format!("  mv {areg}, {val}"));
                 }
             }
@@ -221,14 +227,14 @@ fn emit_inst(e: &mut RvEmitter, inst: &IrInst, frame: &FrameInfo, program: &IrPr
             if let Some(d) = dest { emit_sw(e, "a0", lo(*d)); }
         }
         IrInst::Br { cond, then_bb, else_bb } => {
-            let c = op_to_reg(e, *cond, frame, program, "t0");
+            let c = op_to_reg(e, *cond, frame, program, "t0", param_regs);
             e.emit(&format!("  bnez {c}, {}", block_labels[then_bb]));
             e.emit(&format!("  j {}", block_labels[else_bb]));
         }
         IrInst::Jump { target } => { e.emit(&format!("  j {}", block_labels[target])); }
         IrInst::Ret { value } => {
             if let Some(v) = value {
-                let val = op_to_reg(e, *v, frame, program, "a0");
+                let val = op_to_reg(e, *v, frame, program, "a0", param_regs);
                 if val != "a0" { e.emit(&format!("  mv a0, {val}")); }
             }
             emit_lw(e, "ra", frame.ra_offset);
@@ -240,12 +246,17 @@ fn emit_inst(e: &mut RvEmitter, inst: &IrInst, frame: &FrameInfo, program: &IrPr
     }
 }
 
-fn op_to_reg(e: &mut RvEmitter, op: IrOperand, frame: &FrameInfo, program: &IrProgram, pref: &str) -> String {
+fn op_to_reg(e: &mut RvEmitter, op: IrOperand, frame: &FrameInfo, program: &IrProgram, pref: &str, param_regs: &HashMap<usize, String>) -> String {
     let r = pref.to_string();
     match op {
         IrOperand::Int(n) => { e.emit(&format!("  li {r}, {n}")); r }
         IrOperand::Local(i) => { emit_lw(e, &r, frame.local_offsets.get(&i).copied().unwrap_or(0)); r }
         IrOperand::Global(i) => {
+            // Check if this is a function parameter (arrives in register)
+            if let Some(preg) = param_regs.get(&i) {
+                return preg.clone();
+            }
+            // Check stack-allocated alloca
             if let Some(off) = frame.alloca_offsets.get(&i) {
                 emit_addr(e, &r, *off);
             } else {
