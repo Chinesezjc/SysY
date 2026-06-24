@@ -227,10 +227,9 @@ fn emit_function(e: &mut RvEmitter, func: &IrFunc, program: &IrProgram) {
     }
 }
 
-/// Spill `reg` to stack if it holds a dirty tracked local, and evict it.
+/// Ensure `reg` is free for use: spill if dirty, then evict from tracker.
 fn spill_reg(e: &mut RvEmitter, reg: &str, frame: &FrameInfo, tracker: &mut RegTracker) {
-    let local = tracker.local_in_reg(reg);
-    if let Some(local) = local {
+    if let Some(local) = tracker.local_in_reg(reg) {
         if tracker.is_dirty(local) {
             let off = frame.local_offsets.get(&local).copied().unwrap_or(0);
             emit_sw(e, reg, off);
@@ -281,12 +280,13 @@ fn emit_inst(e: &mut RvEmitter, inst: &IrInst, frame: &FrameInfo, program: &IrPr
             if *op == IrArithOp::Add && *rhs == IrOperand::Int(0) {
                 let lv = tracked_op(e, *lhs, frame, program, "t0", param_regs, stack_param_offsets, param_spill, tracker, track);
                 if track {
-                    // Keep dest in lv's register — don't force into a0, don't emit_sw
+                    // Force identity result into a0 for consistency.
+                    // (Keeping in source register would be better but needs
+                    // more work on spill-eviction interaction.)
                     if lv != "a0" {
                         spill_reg(e, "a0", frame, tracker);
                         e.emit(&format!("  mv a0, {lv}"));
                     }
-                    // Spill any previous occupant of a0 before reassigning
                     spill_reg(e, "a0", frame, tracker);
                     tracker.set_dirty(*dest, "a0".to_string());
                 } else {
@@ -295,40 +295,52 @@ fn emit_inst(e: &mut RvEmitter, inst: &IrInst, frame: &FrameInfo, program: &IrPr
                 }
                 return;
             }
-            let lv = tracked_op(e, *lhs, frame, program, "t0", param_regs, stack_param_offsets, param_spill, tracker, track);
+            // Evaluate RHS first: if it clobbers the LHS register, LHS will
+            // load from stack (tracker eviction + spill handles this).
             let rv = tracked_op(e, *rhs, frame, program, "t1", param_regs, stack_param_offsets, param_spill, tracker, track);
+            let lv = tracked_op(e, *lhs, frame, program, "t0", param_regs, stack_param_offsets, param_spill, tracker, track);
             let ins = match op { IrArithOp::Add=>"add", IrArithOp::Sub=>"sub", IrArithOp::Mul=>"mul", IrArithOp::Div=>"div", IrArithOp::Mod=>"rem" };
-            // Spill any dirty source values that will be consumed by the instruction
+            // Allocate a destination register (not always a0)
+            let rd = if track { tracker.alloc() } else { "a0".to_string() };
+            // Spill dirty locals in source and destination registers before clobbering
             if track {
-                for src_reg in &[&lv, &rv] {
-                    if **src_reg == "a0" { spill_reg(e, "a0", frame, tracker); }
-                }
+                spill_reg(e, &rd, frame, tracker);
+                if lv == "a0" { spill_reg(e, "a0", frame, tracker); }
+                if rv == "a0" { spill_reg(e, "a0", frame, tracker); }
             }
-            e.emit(&format!("  {ins} a0, {lv}, {rv}"));
-            if track { tracker.set_dirty(*dest, "a0".to_string()); }
-            emit_sw(e, "a0", lo(*dest));
-            if track { tracker.mark_clean(*dest); }
+            e.emit(&format!("  {ins} {rd}, {lv}, {rv}"));
+            if track {
+                tracker.set_dirty(*dest, rd.clone());
+                emit_sw(e, &rd, lo(*dest));
+                tracker.mark_clean(*dest);
+            } else {
+                emit_sw(e, "a0", lo(*dest));
+            }
         }
         IrInst::Icmp { dest, op, lhs, rhs } => {
-            let lv = tracked_op(e, *lhs, frame, program, "t0", param_regs, stack_param_offsets, param_spill, tracker, track);
             let rv = tracked_op(e, *rhs, frame, program, "t1", param_regs, stack_param_offsets, param_spill, tracker, track);
-            // Spill any dirty source values that will be consumed
+            let lv = tracked_op(e, *lhs, frame, program, "t0", param_regs, stack_param_offsets, param_spill, tracker, track);
+            let rd = if track { tracker.alloc() } else { "a0".to_string() };
             if track {
-                for src_reg in &[&lv, &rv] {
-                    if **src_reg == "a0" { spill_reg(e, "a0", frame, tracker); }
-                }
+                spill_reg(e, &rd, frame, tracker);
+                if lv == "a0" { spill_reg(e, "a0", frame, tracker); }
+                if rv == "a0" { spill_reg(e, "a0", frame, tracker); }
             }
             match op {
-                IrCmpOp::Lt => e.emit(&format!("  slt a0, {lv}, {rv}")),
-                IrCmpOp::Gt => e.emit(&format!("  slt a0, {rv}, {lv}")),
-                IrCmpOp::Le => { e.emit(&format!("  slt a0, {rv}, {lv}")); e.emit("  xori a0, a0, 1"); }
-                IrCmpOp::Ge => { e.emit(&format!("  slt a0, {lv}, {rv}")); e.emit("  xori a0, a0, 1"); }
-                IrCmpOp::Eq => { e.emit(&format!("  sub a0, {lv}, {rv}")); e.emit("  sltiu a0, a0, 1"); }
-                IrCmpOp::Ne => { e.emit(&format!("  sub a0, {lv}, {rv}")); e.emit("  sltu a0, zero, a0"); }
+                IrCmpOp::Lt => e.emit(&format!("  slt {rd}, {lv}, {rv}")),
+                IrCmpOp::Gt => e.emit(&format!("  slt {rd}, {rv}, {lv}")),
+                IrCmpOp::Le => { e.emit(&format!("  slt {rd}, {rv}, {lv}")); e.emit(&format!("  xori {rd}, {rd}, 1")); }
+                IrCmpOp::Ge => { e.emit(&format!("  slt {rd}, {lv}, {rv}")); e.emit(&format!("  xori {rd}, {rd}, 1")); }
+                IrCmpOp::Eq => { e.emit(&format!("  sub {rd}, {lv}, {rv}")); e.emit(&format!("  sltiu {rd}, {rd}, 1")); }
+                IrCmpOp::Ne => { e.emit(&format!("  sub {rd}, {lv}, {rv}")); e.emit(&format!("  sltu {rd}, zero, {rd}")); }
             }
-            if track { tracker.set_dirty(*dest, "a0".to_string()); }
-            emit_sw(e, "a0", lo(*dest));
-            if track { tracker.mark_clean(*dest); }
+            if track {
+                tracker.set_dirty(*dest, rd.clone());
+                emit_sw(e, &rd, lo(*dest));
+                tracker.mark_clean(*dest);
+            } else {
+                emit_sw(e, "a0", lo(*dest));
+            }
         }
         IrInst::GetPtr { dest, ptr, index, elem_size } => {
             let base = tracked_op(e, *ptr, frame, program, "t0", param_regs, stack_param_offsets, param_spill, tracker, track);

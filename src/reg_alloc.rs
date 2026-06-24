@@ -18,8 +18,10 @@ pub(crate) struct RegTracker {
 
 impl RegTracker {
     pub fn new() -> Self {
-        // t0-t4 for general use; t5-t6 reserved for helpers
-        let pool = vec!["t4","t3","t2","t1","t0"]
+        // t0-t2 for general use.
+        // t3 reserved: used as scratch by emit_lw/emit_sw/emit_offset_mul large-offset path.
+        // t4-t6 reserved for future use.
+        let pool = vec!["t2","t1","t0"]
             .iter().map(|s| s.to_string()).collect();
         RegTracker {
             locals: HashMap::new(),
