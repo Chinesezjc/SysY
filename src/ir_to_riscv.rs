@@ -157,12 +157,14 @@ fn emit_function(e: &mut RvEmitter, func: &IrFunc, program: &IrProgram) {
     // we must spill their register value to the stack so it survives clobbers.
     let mut param_spill: HashMap<usize, i32> = HashMap::new();
 
-    // Allocate spill slots within the frame for params without allocas
+    // Allocate spill slots within the frame for params without allocas.
+    // Only array/pointer params need spill slots (registers may be clobbered).
+    // Scalar params stay in registers via param_regs.
     let mut spill_slot = frame.frame_size;
-    for (i, (pn, _)) in func.params.iter().enumerate() {
+    for (i, (pn, pty)) in func.params.iter().enumerate() {
         if i < 8 {
             param_regs.insert(*pn, format!("a{}", i));
-            if !frame.alloca_offsets.contains_key(pn) {
+            if !frame.alloca_offsets.contains_key(pn) && matches!(pty, IrType::Ptr(_)) {
                 param_spill.insert(*pn, spill_slot);
                 spill_slot += 4;
             }
@@ -236,6 +238,13 @@ fn emit_inst(e: &mut RvEmitter, inst: &IrInst, frame: &FrameInfo, program: &IrPr
             e.emit(&format!("  sw {val}, 0({p})"));
         }
         IrInst::Arith { dest, op, lhs, rhs } => {
+            // Identity elimination: add x, 0 → just use x's register
+            if *op == IrArithOp::Add && *rhs == IrOperand::Int(0) {
+                let lv = op_to_reg(e, *lhs, frame, program, "t0", param_regs, stack_param_offsets, param_spill);
+                if lv != "a0" { e.emit(&format!("  mv a0, {lv}")); }
+                emit_sw(e, "a0", lo(*dest));
+                return;
+            }
             let lv = op_to_reg(e, *lhs, frame, program, "t0", param_regs, stack_param_offsets, param_spill);
             let rv = op_to_reg(e, *rhs, frame, program, "t1", param_regs, stack_param_offsets, param_spill);
             let ins = match op { IrArithOp::Add=>"add", IrArithOp::Sub=>"sub", IrArithOp::Mul=>"mul", IrArithOp::Div=>"div", IrArithOp::Mod=>"rem" };
