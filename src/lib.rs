@@ -10,6 +10,7 @@ mod ir_to_riscv;
 mod lexer;
 mod opt;
 mod parser;
+mod reg_alloc;
 mod ssa;
 
 pub use error::{CompilerError, CompilerResult};
