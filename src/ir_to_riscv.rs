@@ -293,34 +293,47 @@ fn emit_inst(e: &mut RvEmitter, inst: &IrInst, frame: &FrameInfo, program: &IrPr
             if *op == IrArithOp::Add && *rhs == IrOperand::Int(0) {
                 let lv = tracked_op(e, *lhs, frame, program, "t0", param_regs, stack_param_offsets, param_spill, tracker, track);
                 if track {
-                    // Identity result: force into a0, then set dirty.
-                    // (Keeping in source register needs operand materialization.)
-                    if lv != "a0" {
+                    // Virtual register: keep dest in lv's register.
+                    // Only safe for param registers (a0-a7) which aren't
+                    // in the allocator pool. Temp registers may cause
+                    // clobber chains with complex live ranges.
+                    let keep_in_source = lv.starts_with('a');
+                    if keep_in_source {
+                        if let Some(evicted) = tracker.set_dirty(*dest, lv.clone()) {
+                            if tracker.is_dirty(evicted) {
+                                emit_sw(e, &lv, lo(evicted));
+                            }
+                        }
+                    } else {
+                        if lv != "a0" {
+                            spill_reg(e, "a0", frame, tracker);
+                            e.emit(&format!("  mv a0, {lv}"));
+                        }
                         spill_reg(e, "a0", frame, tracker);
-                        e.emit(&format!("  mv a0, {lv}"));
+                        tracker.set_dirty(*dest, "a0".to_string());
                     }
-                    spill_reg(e, "a0", frame, tracker);
-                    tracker.set_dirty(*dest, "a0".to_string());
                 } else {
                     if lv != "a0" { e.emit(&format!("  mv a0, {lv}")); }
                     emit_sw(e, "a0", lo(*dest));
                 }
                 return;
             }
-            // Evaluate RHS first: if it clobbers the LHS register, LHS will
-            // load from stack (tracker eviction + spill handles this).
+            // LHS first: if it's in a tracked register that RHS (pref="t1")
+            // might clobber, materialize it to a safe register first.
+            let mut lv = tracked_op(e, *lhs, frame, program, "t0", param_regs, stack_param_offsets, param_spill, tracker, track);
+            if track && lv == "t1" && tracker.reg_in_use(&lv) {
+                let (safe, evicted) = tracker.alloc();
+                if let Some(el) = evicted { if tracker.is_dirty(el) { emit_sw(e, &safe, lo(el)); } }
+                spill_reg(e, &safe, frame, tracker);
+                e.emit(&format!("  mv {safe}, {lv}"));
+                lv = safe;
+            }
             let rv = tracked_op(e, *rhs, frame, program, "t1", param_regs, stack_param_offsets, param_spill, tracker, track);
-            let lv = tracked_op(e, *lhs, frame, program, "t0", param_regs, stack_param_offsets, param_spill, tracker, track);
             let ins = match op { IrArithOp::Add=>"add", IrArithOp::Sub=>"sub", IrArithOp::Mul=>"mul", IrArithOp::Div=>"div", IrArithOp::Mod=>"rem" };
             if track {
                 let (rd, evicted) = tracker.alloc();
-                if let Some(el) = evicted {
-                    if tracker.is_dirty(el) {
-                        emit_sw(e, &rd, lo(el));
-                    }
-                }
+                if let Some(el) = evicted { if tracker.is_dirty(el) { emit_sw(e, &rd, lo(el)); } }
                 e.emit(&format!("  {ins} {rd}, {lv}, {rv}"));
-                // Virtual register: rd IS the primary storage for dest
                 tracker.set_dirty(*dest, rd);
             } else {
                 e.emit(&format!("  {ins} a0, {lv}, {rv}"));
@@ -328,8 +341,15 @@ fn emit_inst(e: &mut RvEmitter, inst: &IrInst, frame: &FrameInfo, program: &IrPr
             }
         }
         IrInst::Icmp { dest, op, lhs, rhs } => {
+            let mut lv = tracked_op(e, *lhs, frame, program, "t0", param_regs, stack_param_offsets, param_spill, tracker, track);
+            if track && lv == "t1" && tracker.reg_in_use(&lv) {
+                let (safe, evicted) = tracker.alloc();
+                if let Some(el) = evicted { if tracker.is_dirty(el) { emit_sw(e, &safe, lo(el)); } }
+                spill_reg(e, &safe, frame, tracker);
+                e.emit(&format!("  mv {safe}, {lv}"));
+                lv = safe;
+            }
             let rv = tracked_op(e, *rhs, frame, program, "t1", param_regs, stack_param_offsets, param_spill, tracker, track);
-            let lv = tracked_op(e, *lhs, frame, program, "t0", param_regs, stack_param_offsets, param_spill, tracker, track);
             let rd: String;
             if track {
                 let (r, evicted) = tracker.alloc();
