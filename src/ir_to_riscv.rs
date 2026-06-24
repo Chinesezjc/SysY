@@ -213,8 +213,20 @@ fn emit_function(e: &mut RvEmitter, func: &IrFunc, program: &IrProgram) {
     // Emit blocks
     for block in &func.blocks {
         e.emit_label(&block_labels[&block.label]);
-        if !single_block { tracker.clear(); }
-        for inst in &block.instrs { emit_inst(e, inst, &frame, program, &block_labels, &param_regs, &stack_param_offsets, &param_spill, &mut tracker, single_block); }
+        if single_block {
+            tracker.build_intervals(block);
+        } else {
+            tracker.clear();
+        }
+        for (i, inst) in block.instrs.iter().enumerate() {
+            if single_block {
+                for (local, reg) in tracker.advance(i) {
+                    let off = frame.local_offsets.get(&local).copied().unwrap_or(0);
+                    emit_sw(e, &reg, off);
+                }
+            }
+            emit_inst(e, inst, &frame, program, &block_labels, &param_regs, &stack_param_offsets, &param_spill, &mut tracker, single_block);
+        }
     }
 
     // Fallback epilogue
@@ -280,9 +292,8 @@ fn emit_inst(e: &mut RvEmitter, inst: &IrInst, frame: &FrameInfo, program: &IrPr
             if *op == IrArithOp::Add && *rhs == IrOperand::Int(0) {
                 let lv = tracked_op(e, *lhs, frame, program, "t0", param_regs, stack_param_offsets, param_spill, tracker, track);
                 if track {
-                    // Force identity result into a0 for consistency.
-                    // (Keeping in source register would be better but needs
-                    // more work on spill-eviction interaction.)
+                    // Force identity result into a0 to avoid clobber issues
+                    // with subsequent operand evaluation.
                     if lv != "a0" {
                         spill_reg(e, "a0", frame, tracker);
                         e.emit(&format!("  mv a0, {lv}"));
@@ -302,11 +313,10 @@ fn emit_inst(e: &mut RvEmitter, inst: &IrInst, frame: &FrameInfo, program: &IrPr
             let ins = match op { IrArithOp::Add=>"add", IrArithOp::Sub=>"sub", IrArithOp::Mul=>"mul", IrArithOp::Div=>"div", IrArithOp::Mod=>"rem" };
             // Allocate a destination register (not always a0)
             let rd = if track { tracker.alloc() } else { "a0".to_string() };
-            // Spill dirty locals in source and destination registers before clobbering
+            // Spill destination register if occupied; but DON'T spill source
+            // registers (they're being read, not clobbered, since rd != a0).
             if track {
                 spill_reg(e, &rd, frame, tracker);
-                if lv == "a0" { spill_reg(e, "a0", frame, tracker); }
-                if rv == "a0" { spill_reg(e, "a0", frame, tracker); }
             }
             e.emit(&format!("  {ins} {rd}, {lv}, {rv}"));
             if track {
@@ -323,8 +333,6 @@ fn emit_inst(e: &mut RvEmitter, inst: &IrInst, frame: &FrameInfo, program: &IrPr
             let rd = if track { tracker.alloc() } else { "a0".to_string() };
             if track {
                 spill_reg(e, &rd, frame, tracker);
-                if lv == "a0" { spill_reg(e, "a0", frame, tracker); }
-                if rv == "a0" { spill_reg(e, "a0", frame, tracker); }
             }
             match op {
                 IrCmpOp::Lt => e.emit(&format!("  slt {rd}, {lv}, {rv}")),

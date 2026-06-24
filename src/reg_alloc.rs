@@ -1,9 +1,11 @@
-//! Linear-scan register allocator for the RISC-V backend.
+//! Linear-scan register allocator using live intervals.
 //!
-//! Tracks which local temporaries are held in registers and spills only
-//! when a register is needed for another value.  Works within a single basic
-//! block (register state is flushed at block boundaries).
+//! For each basic block we pre-compute the last-use position of every local
+//! temporary.  During emission, registers holding locals whose last use has
+//! passed are automatically freed.  This gives much better results than the
+//! simple "evict-LRU" strategy because we know exactly when a value is dead.
 
+use crate::ir::*;
 use std::collections::HashMap;
 
 /// Manages a pool of allocatable RISC-V registers for local temporaries.
@@ -14,20 +16,57 @@ pub(crate) struct RegTracker {
     reg_to_local: HashMap<String, usize>,
     /// Available registers in preference order
     pool: Vec<String>,
+    /// last-use position for each local (instruction index within block)
+    last_use: HashMap<usize, usize>,
+    /// current instruction position in the block
+    pos: usize,
 }
 
 impl RegTracker {
     pub fn new() -> Self {
         // t0-t2 for general use.
         // t3 reserved: used as scratch by emit_lw/emit_sw/emit_offset_mul large-offset path.
-        // t4-t6 reserved for future use.
         let pool = vec!["t2","t1","t0"]
             .iter().map(|s| s.to_string()).collect();
         RegTracker {
             locals: HashMap::new(),
             reg_to_local: HashMap::new(),
             pool,
+            last_use: HashMap::new(),
+            pos: 0,
         }
+    }
+
+    /// Pre-compute last-use positions by scanning a block's instructions.
+    pub fn build_intervals(&mut self, block: &IrBlock) {
+        self.last_use.clear();
+        for (i, inst) in block.instrs.iter().enumerate() {
+            // Record last-use for each operand
+            for op in inst.operands() {
+                if let IrOperand::Local(l) = *op {
+                    self.last_use.insert(l, i);
+                }
+            }
+        }
+        // Remove entries for locals that are only defined (never used)
+        // — they can be freed immediately after definition.
+    }
+
+    /// Advance to instruction position `p`, freeing registers whose
+    /// locals are now dead (last use has passed).
+    /// Returns (local, register) pairs for dead dirty locals that need spilling.
+    pub fn advance(&mut self, p: usize) -> Vec<(usize, String)> {
+        self.pos = p;
+        let dead: Vec<(usize, String, bool)> = self.locals.iter()
+            .filter(|(l, _)| self.last_use.get(l).map_or(true, |&end| p > end))
+            .map(|(l, (r, d))| (*l, r.clone(), *d))
+            .collect();
+        let mut spills = Vec::new();
+        for (l, r, dirty) in dead {
+            if dirty { spills.push((l, r)); }
+            self.evict(l);
+        }
+        spills
     }
 
     /// Return the register holding `local`, or None if not cached.
@@ -35,27 +74,28 @@ impl RegTracker {
         self.locals.get(&local).map(|(r, _)| r.clone())
     }
 
-    /// Allocate a free register, spilling the least-preferred occupied one
-    /// if needed.  Returns the register name.
-    /// Caller must NOT have already marked this register in use — the
-    /// returned register is guaranteed free after any spill.
+    /// Allocate a free register.  With live-interval information, most
+    /// allocations succeed without eviction.
     pub fn alloc(&mut self) -> String {
         for reg in &self.pool {
             if !self.reg_to_local.contains_key(reg) {
                 return reg.clone();
             }
         }
-        // All pool registers occupied — evict the lowest-priority one
-        let evict = self.pool.last().unwrap().clone();
-        // Remove the evicted local from tracking (caller must spill it)
+        // All pool registers occupied — evict the one whose local dies last
+        // (farthest next use = least urgent to keep in register).
+        let evict = self.pool.iter()
+            .filter_map(|r| self.reg_to_local.get(r).map(|&l| (r.clone(), l)))
+            .max_by_key(|(_, l)| self.last_use.get(l).copied().unwrap_or(usize::MAX))
+            .map(|(r, _)| r)
+            .unwrap_or_else(|| self.pool.last().unwrap().clone());
         if let Some(local) = self.reg_to_local.remove(&evict) {
             self.locals.remove(&local);
         }
         evict
     }
 
-    /// Record that `local` is now held in `reg`, and is dirty
-    /// (not yet written back to its stack slot).
+    /// Record that `local` is now held in `reg`, and is dirty.
     /// Returns the evicted local index if `reg` was previously occupied.
     pub fn set_dirty(&mut self, local: usize, reg: String) -> Option<usize> {
         let evicted = self.reg_to_local.remove(&reg);
@@ -67,20 +107,19 @@ impl RegTracker {
         evicted
     }
 
-    /// Mark `local` as clean (value has been written back to stack).
-    /// Keeps the register mapping so subsequent uses can still find it.
+    /// Mark `local` as clean (value written back to stack).
     pub fn mark_clean(&mut self, local: usize) {
         if let Some(entry) = self.locals.get_mut(&local) {
             entry.1 = false;
         }
     }
 
-    /// Check if `local` is dirty (register value differs from stack).
+    /// Check if `local` is dirty.
     pub fn is_dirty(&self, local: usize) -> bool {
         self.locals.get(&local).map_or(false, |(_, d)| *d)
     }
 
-    /// Return true if `reg` is currently tracked as holding a local.
+    /// Return true if `reg` is currently tracked.
     pub fn reg_in_use(&self, reg: &str) -> bool {
         self.reg_to_local.contains_key(reg)
     }
@@ -90,7 +129,7 @@ impl RegTracker {
         self.reg_to_local.get(reg).copied()
     }
 
-    /// Remove a specific local→register mapping. Returns the register it was in.
+    /// Remove a specific local→register mapping.
     pub fn evict(&mut self, local: usize) -> Option<String> {
         if let Some((reg, _)) = self.locals.remove(&local) {
             self.reg_to_local.remove(&reg);
@@ -100,7 +139,7 @@ impl RegTracker {
         }
     }
 
-    /// Remove mapping for a specific register. Returns the local it held.
+    /// Remove mapping for a specific register.
     pub fn evict_reg(&mut self, reg: &str) -> Option<usize> {
         if let Some(local) = self.reg_to_local.remove(reg) {
             self.locals.remove(&local);
@@ -114,7 +153,7 @@ impl RegTracker {
     pub fn flush_dirty(&mut self) -> Vec<(usize, String)> {
         let dirty: Vec<(usize, String)> = self.locals.iter()
             .filter(|(_, (_, d))| *d)
-            .map(|(&l, (r, _))| (l, r.clone()))
+            .map(|(l, (r, _))| (*l, r.clone()))
             .collect();
         for (local, _) in &dirty {
             self.evict(*local);
@@ -122,9 +161,11 @@ impl RegTracker {
         dirty
     }
 
-    /// Clear all state (for block boundaries).
+    /// Clear all state.
     pub fn clear(&mut self) {
         self.locals.clear();
         self.reg_to_local.clear();
+        self.last_use.clear();
+        self.pos = 0;
     }
 }
