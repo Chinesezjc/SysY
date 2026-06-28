@@ -54,19 +54,19 @@ impl RegTracker {
 
     /// Advance to instruction position `p`, freeing registers whose
     /// locals are now dead (last use has passed).
-    /// Returns (local, register) pairs for dead dirty locals that need spilling.
+    /// Dead locals are simply evicted — their values will never be read
+    /// again, so no spill is needed. This eliminates dead stores.
+    /// Returns empty vec (no spills needed).
     pub fn advance(&mut self, p: usize) -> Vec<(usize, String)> {
         self.pos = p;
-        let dead: Vec<(usize, String, bool)> = self.locals.iter()
+        let dead: Vec<usize> = self.locals.iter()
             .filter(|(l, _)| self.last_use.get(l).map_or(true, |&end| p > end))
-            .map(|(l, (r, d))| (*l, r.clone(), *d))
+            .map(|(l, _)| *l)
             .collect();
-        let mut spills = Vec::new();
-        for (l, r, dirty) in dead {
-            if dirty { spills.push((l, r)); }
+        for l in dead {
             self.evict(l);
         }
-        spills
+        Vec::new()
     }
 
     /// Return the register holding `local`, or None if not cached.
