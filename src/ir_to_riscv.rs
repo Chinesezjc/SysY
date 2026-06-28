@@ -190,9 +190,18 @@ fn emit_function(e: &mut RvEmitter, func: &IrFunc, program: &IrProgram) {
     let fn_name = program.func_name(func.name).strip_prefix('@').unwrap_or(program.func_name(func.name));
     e.emit(&format!("  .globl {fn_name}")); e.emit_label(fn_name);
 
+    // Detect leaf function (no call instructions)
+    let is_leaf = func.blocks.iter().all(|b| b.instrs.iter().all(|i| !matches!(i, IrInst::Call{..})));
+    // Always need frame if there are stack slots (locals or allocas).
+    // Leaf functions can skip ra save/restore but still need sp adjustment
+    // for spilling dead locals at advance boundaries.
+    let needs_frame = tf > 0;
+
     // Prologue
-    emit_addi_sp(e, -tf);
-    emit_sw(e, "ra", frame.ra_offset);
+    if needs_frame {
+        emit_addi_sp(e, -tf);
+        if !is_leaf { emit_sw(e, "ra", frame.ra_offset); }
+    }
 
     // Store register params to their stack slots (alloca slots or spill slots)
     for (i, (pn, _)) in func.params.iter().enumerate() {
@@ -225,7 +234,7 @@ fn emit_function(e: &mut RvEmitter, func: &IrFunc, program: &IrProgram) {
                     emit_sw(e, &reg, off);
                 }
             }
-            emit_inst(e, inst, &frame, program, &block_labels, &param_regs, &stack_param_offsets, &param_spill, &mut tracker, single_block);
+            emit_inst(e, inst, &frame, program, &block_labels, &param_regs, &stack_param_offsets, &param_spill, &mut tracker, single_block, is_leaf, needs_frame);
         }
     }
 
@@ -233,8 +242,10 @@ fn emit_function(e: &mut RvEmitter, func: &IrFunc, program: &IrProgram) {
     let has_ret = func.blocks.last().map_or(false, |b| b.instrs.last().map_or(false, |i| matches!(i, IrInst::Ret{..})));
     if !has_ret {
         if func.ret_type != IrType::Void { e.emit("  li a0, 0"); }
-        emit_lw(e, "ra", frame.ra_offset);
-        emit_addi_sp(e, tf);
+        if needs_frame {
+            if !is_leaf { emit_lw(e, "ra", frame.ra_offset); }
+            emit_addi_sp(e, tf);
+        }
         e.emit("  ret");
     }
 }
@@ -266,7 +277,7 @@ fn tracked_op(e: &mut RvEmitter, op: IrOperand, frame: &FrameInfo, program: &IrP
     r
 }
 
-fn emit_inst(e: &mut RvEmitter, inst: &IrInst, frame: &FrameInfo, program: &IrProgram, block_labels: &HashMap<usize, String>, param_regs: &HashMap<usize, String>, stack_param_offsets: &HashMap<usize, i32>, param_spill: &HashMap<usize, i32>, tracker: &mut RegTracker, track: bool) {
+fn emit_inst(e: &mut RvEmitter, inst: &IrInst, frame: &FrameInfo, program: &IrProgram, block_labels: &HashMap<usize, String>, param_regs: &HashMap<usize, String>, stack_param_offsets: &HashMap<usize, i32>, param_spill: &HashMap<usize, i32>, tracker: &mut RegTracker, track: bool, is_leaf: bool, needs_frame: bool) {
     let lo = |i: usize| frame.local_offsets.get(&i).copied().unwrap_or(0);
 
     match inst {
@@ -511,8 +522,10 @@ fn emit_inst(e: &mut RvEmitter, inst: &IrInst, frame: &FrameInfo, program: &IrPr
                     tracker.evict(local);
                 }
             }
-            emit_lw(e, "ra", frame.ra_offset);
-            emit_addi_sp(e, frame.frame_size);
+            if needs_frame {
+                if !is_leaf { emit_lw(e, "ra", frame.ra_offset); }
+                emit_addi_sp(e, frame.frame_size);
+            }
             e.emit("  ret");
         }
         IrInst::Phi { .. } => e.emit("  # phi"),
