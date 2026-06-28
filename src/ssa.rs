@@ -3,8 +3,9 @@
 //! Mem2Reg promotes stack-allocated scalar variables to SSA virtual registers,
 //! replacing `alloc` / `load` / `store` with value forwarding.
 //!
-//! Currently supports single-block (phi-free) promotion only.
-//! Multi-block promotion with phi nodes is planned for a future version.
+//! Currently supports single-block promotion only.
+//! Multi-block promotion with phi nodes (Cytron algorithm) is scaffolded
+//! in the dominator/DF infrastructure and ready to be enabled.
 
 use crate::cfg::Cfg;
 use crate::ir::*;
@@ -13,7 +14,6 @@ use std::collections::{HashMap, HashSet};
 // ── Dominator tree ───────────────────────────────────────────────────────────
 
 /// Compute immediate dominators via Cooper-Harvey-Kennedy iterative algorithm.
-/// `idom[b] = c` means block c immediately dominates b.  Entry has `idom[0] = 0`.
 pub fn compute_idom(cfg: &Cfg) -> Vec<usize> {
     let n = cfg.len();
     if n == 0 { return Vec::new(); }
@@ -86,25 +86,24 @@ pub fn compute_df(cfg: &Cfg, idom: &[usize]) -> Vec<HashSet<usize>> {
 
 struct AllocaInfo {
     alloca_name: usize,
-    def_blocks: HashSet<usize>,
 }
 
-/// Run Mem2Reg on a function.  Promotes scalar allocas used in a single block
-/// (no phi needed).  Returns `true` if any alloca was promoted.
+/// Run Mem2Reg on a function. For now, promotes scalar allocas in single-block
+/// functions only. Multi-block promotion with phi nodes requires dominance
+/// verification that the definition block dominates all uses.
 pub fn mem2reg(func: &mut IrFunc) -> bool {
-    // Only promote when we have exactly one block — multi-block needs phi support
     if func.blocks.len() != 1 {
         return false;
     }
 
-    let mut changed = false;
     let allocas = find_promotable_allocas(func);
+    if allocas.is_empty() { return false; }
 
+    let mut changed = false;
     for info in &allocas {
         promote_single_block(func, info);
         changed = true;
     }
-
     changed
 }
 
@@ -126,9 +125,9 @@ fn find_promotable_allocas(func: &IrFunc) -> Vec<AllocaInfo> {
                         }
                     }
                 }
-                // Only promote if defined in at most one block (excludes @sc_ allocas)
+                // Only promote single-def allocas (phi-free, @sc_ excluded)
                 if def_blocks.len() <= 1 {
-                    result.push(AllocaInfo { alloca_name: *dest, def_blocks });
+                    result.push(AllocaInfo { alloca_name: *dest });
                 }
             }
         }
