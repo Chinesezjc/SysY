@@ -192,9 +192,9 @@ fn emit_function(e: &mut RvEmitter, func: &IrFunc, program: &IrProgram) {
 
     // Detect leaf function (no call instructions)
     let is_leaf = func.blocks.iter().all(|b| b.instrs.iter().all(|i| !matches!(i, IrInst::Call{..})));
-    // Always need frame if there are stack slots (locals or allocas).
-    // Leaf functions can skip ra save/restore but still need sp adjustment
-    // for spilling dead locals at advance boundaries.
+    // Frame is needed if any stack space was allocated (tf > 0).
+    // This includes local spill slots, array allocas, and param spills.
+    // Leaf functions skip only ra save/restore, not the frame itself.
     let needs_frame = tf > 0;
 
     // Prologue
