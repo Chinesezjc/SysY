@@ -18,8 +18,12 @@ pub(crate) struct RegTracker {
     pool: Vec<String>,
     /// last-use position for each local (instruction index within block)
     last_use: HashMap<usize, usize>,
+    /// first definition position for each local
+    first_def: HashMap<usize, usize>,
     /// current instruction position in the block
     pos: usize,
+    /// maximum number of simultaneously-live pool-register values
+    pub max_pool_pressure: usize,
 }
 
 impl RegTracker {
@@ -33,23 +37,65 @@ impl RegTracker {
             reg_to_local: HashMap::new(),
             pool,
             last_use: HashMap::new(),
+            first_def: HashMap::new(),
             pos: 0,
+            max_pool_pressure: 0,
         }
     }
 
-    /// Pre-compute last-use positions by scanning a block's instructions.
+    /// Pre-compute last-use positions and register pressure.
     pub fn build_intervals(&mut self, block: &IrBlock) {
         self.last_use.clear();
+        self.first_def.clear();
         for (i, inst) in block.instrs.iter().enumerate() {
-            // Record last-use for each operand
+            // Record first-def (only if not already set)
+            if let Some(dest) = inst.dest() {
+                self.first_def.entry(dest).or_insert(i);
+            }
+            // Record last-use for each operand (overwrites = last one wins)
             for op in inst.operands() {
                 if let IrOperand::Local(l) = *op {
                     self.last_use.insert(l, i);
                 }
             }
         }
-        // Remove entries for locals that are only defined (never used)
-        // — they can be freed immediately after definition.
+        // Compute max pool pressure: at each position, count locals
+        // that are live AND would be allocated from the pool (not params).
+        // Pool locals are those defined by Arith/Icmp/GetPtr/GetElemPtr/Load
+        // (not those that come from identity-of-param, which use param regs).
+        let mut pressure: Vec<usize> = vec![0; block.instrs.len() + 1];
+        for (&local, &def) in &self.first_def {
+            let end = self.last_use.get(&local).copied().unwrap_or(def);
+            // Count only if this local will be allocated from the pool.
+            // Identity-of-param locals are NOT counted (they use param regs).
+            if self.is_pool_local(block, local) {
+                for p in def..=end {
+                    if p < pressure.len() { pressure[p] += 1; }
+                }
+            }
+        }
+        self.max_pool_pressure = pressure.iter().copied().max().unwrap_or(0);
+    }
+
+    /// Determine if a local is pool-allocated (Arith/Icmp/GetPtr/etc. result)
+    /// vs param-register-allocated (identity-of-param).
+    fn is_pool_local(&self, block: &IrBlock, local: usize) -> bool {
+        for inst in &block.instrs {
+            if inst.dest() == Some(local) {
+                // Identity-of-param (add @param, 0) uses param register, not pool.
+                if let IrInst::Arith { op: IrArithOp::Add, rhs: IrOperand::Int(0), lhs, .. } = inst {
+                    if matches!(lhs, IrOperand::Global(_)) {
+                        return false; // param register, not pool
+                    }
+                }
+                return matches!(inst,
+                    IrInst::Arith { .. } | IrInst::Icmp { .. } |
+                    IrInst::GetPtr { .. } | IrInst::GetElemPtr { .. } |
+                    IrInst::Load { .. } | IrInst::Call { .. }
+                );
+            }
+        }
+        false
     }
 
     /// Advance to instruction position `p`, freeing registers whose

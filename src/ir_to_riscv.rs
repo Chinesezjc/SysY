@@ -188,14 +188,31 @@ fn emit_function(e: &mut RvEmitter, func: &IrFunc, program: &IrProgram) {
 
     let tf = frame.frame_size;
     let fn_name = program.func_name(func.name).strip_prefix('@').unwrap_or(program.func_name(func.name));
-    e.emit(&format!("  .globl {fn_name}")); e.emit_label(fn_name);
 
     // Detect leaf function (no call instructions)
     let is_leaf = func.blocks.iter().all(|b| b.instrs.iter().all(|i| !matches!(i, IrInst::Call{..})));
-    // Frame is needed if any stack space was allocated (tf > 0).
-    // This includes local spill slots, array allocas, and param spills.
-    // Leaf functions skip only ra save/restore, not the frame itself.
-    let needs_frame = tf > 0;
+    let single_block = func.blocks.len() == 1;
+
+    // Build live intervals to compute register pressure before prologue
+    let mut tracker = RegTracker::new();
+    if single_block {
+        for block in &func.blocks {
+            tracker.build_intervals(block);
+        }
+    }
+    // Frame is needed if:
+    // - Non-leaf (calls other functions — need ra save + arg spill area)
+    // - Has array allocas (need fixed stack storage)
+    // - Has array params (param_spill entries — need frame for pointer storage)
+    // - Has >8 params (stack args need frame-relative addressing)
+    // - Pool pressure exceeds capacity (need spill slots)
+    let needs_frame = !is_leaf
+        || frame.alloca_offsets.len() > 0
+        || param_spill.len() > 0
+        || func.params.len() > 8
+        || (single_block && tracker.max_pool_pressure > 3);
+
+    e.emit(&format!("  .globl {fn_name}")); e.emit_label(fn_name);
 
     // Prologue
     if needs_frame {
@@ -211,10 +228,6 @@ fn emit_function(e: &mut RvEmitter, func: &IrFunc, program: &IrProgram) {
         else if let Some(&off) = param_spill.get(pn) { emit_sw(e, reg, off); }
     }
 
-    // Register tracker for single-block functions
-    let single_block = func.blocks.len() == 1;
-    let mut tracker = RegTracker::new();
-
     // Block labels
     let mut block_labels: HashMap<usize, String> = HashMap::new();
     for block in &func.blocks { block_labels.insert(block.label, e.fresh_label()); }
@@ -222,11 +235,7 @@ fn emit_function(e: &mut RvEmitter, func: &IrFunc, program: &IrProgram) {
     // Emit blocks
     for block in &func.blocks {
         e.emit_label(&block_labels[&block.label]);
-        if single_block {
-            tracker.build_intervals(block);
-        } else {
-            tracker.clear();
-        }
+        if !single_block { tracker.clear(); }
         for (i, inst) in block.instrs.iter().enumerate() {
             if single_block {
                 for (local, reg) in tracker.advance(i) {
