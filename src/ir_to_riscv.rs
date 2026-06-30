@@ -270,6 +270,13 @@ fn spill_reg(e: &mut RvEmitter, reg: &str, frame: &FrameInfo, tracker: &mut RegT
     }
 }
 
+/// If `op` is a Global alloca, return its sp-relative offset (if in range).
+fn alloca_offset(op: IrOperand, frame: &FrameInfo) -> Option<i32> {
+    if let IrOperand::Global(i) = op {
+        frame.alloca_offsets.get(&i).copied()
+    } else { None }
+}
+
 /// Load an operand into a register, checking the tracker first for locals.
 fn tracked_op(e: &mut RvEmitter, op: IrOperand, frame: &FrameInfo, program: &IrProgram, pref: &str, param_regs: &HashMap<usize, String>, stack_param_offsets: &HashMap<usize, i32>, param_spill: &HashMap<usize, i32>, tracker: &mut RegTracker, active: bool) -> String {
     // For local operands, check tracker first
@@ -293,10 +300,15 @@ fn emit_inst(e: &mut RvEmitter, inst: &IrInst, frame: &FrameInfo, program: &IrPr
         IrInst::Alloc { .. } => {}
 
         IrInst::Load { dest, src } => {
-            let addr = tracked_op(e, *src, frame, program, "t2", param_regs, stack_param_offsets, param_spill, tracker, track);
-            e.emit(&format!("  lw t0, 0({addr})"));
+            let off = alloca_offset(*src, frame);
+            if let Some(off) = off {
+                // Direct sp-relative load (saves addi instruction)
+                emit_lw(e, "t0", off);
+            } else {
+                let addr = tracked_op(e, *src, frame, program, "t2", param_regs, stack_param_offsets, param_spill, tracker, track);
+                e.emit(&format!("  lw t0, 0({addr})"));
+            }
             if track {
-                // t0 now holds the loaded value — it's the virtual register for dest
                 spill_reg(e, "t0", frame, tracker);
                 tracker.set_dirty(*dest, "t0".to_string());
             } else {
@@ -305,8 +317,13 @@ fn emit_inst(e: &mut RvEmitter, inst: &IrInst, frame: &FrameInfo, program: &IrPr
         }
         IrInst::Store { value, ptr } => {
             let val = tracked_op(e, *value, frame, program, "t1", param_regs, stack_param_offsets, param_spill, tracker, track);
-            let p = tracked_op(e, *ptr, frame, program, "t2", param_regs, stack_param_offsets, param_spill, tracker, track);
-            e.emit(&format!("  sw {val}, 0({p})"));
+            let off = alloca_offset(*ptr, frame);
+            if let Some(off) = off {
+                emit_sw(e, &val, off);
+            } else {
+                let p = tracked_op(e, *ptr, frame, program, "t2", param_regs, stack_param_offsets, param_spill, tracker, track);
+                e.emit(&format!("  sw {val}, 0({p})"));
+            }
         }
         IrInst::Arith { dest, op, lhs, rhs } => {
             // Identity elimination with register tracking
