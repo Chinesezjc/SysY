@@ -30,6 +30,10 @@ fn compile_to_ir(program: &CompUnit) -> CompilerResult<IrProgram> {
     pm.add_func_pass(Box::new(opt::dce::DeadCodeElim));
     pm.add_func_pass(Box::new(opt::gvn::GVN));
     pm.run(&mut ir);
+    // Lower phi nodes before RISC-V emission
+    for func in &mut ir.funcs {
+        ssa::lower_phis(func);
+    }
     Ok(ir)
 }
 
