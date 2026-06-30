@@ -120,9 +120,9 @@ impl RegTracker {
         self.locals.get(&local).map(|(r, _)| r.clone())
     }
 
-    /// Allocate a free register. If all are occupied, evicts the one whose
-    /// local dies farthest in the future. Returns (register, Option<evicted_local>).
-    /// The caller must spill the evicted local if it was dirty.
+    /// Allocate a register. Tries a0 first if free, then pool registers.
+    /// Evicts farthest-use if all occupied.
+    /// Note: a0 is NOT freed here if occupied — advance() handles that.
     pub fn alloc(&mut self) -> (String, Option<usize>) {
         for reg in &self.pool {
             if !self.reg_to_local.contains_key(reg) {
@@ -141,6 +141,26 @@ impl RegTracker {
             (evict_reg, Some(local))
         } else {
             (evict_reg, None)
+        }
+    }
+
+    /// Try to get a0 as destination. Only succeeds if a0 is free or its
+    /// occupant's last use is at this position (will be consumed by the
+    /// instruction that uses a0 as both source and destination).
+    pub fn try_alloc_a0(&mut self) -> Option<String> {
+        if !self.reg_to_local.contains_key("a0") {
+            return Some("a0".to_string());
+        }
+        // a0 occupied — only take it if occupant dies exactly at this position
+        // (the instruction consuming it as a source operand)
+        let occ = self.reg_to_local.get("a0").copied()?;
+        let end = *self.last_use.get(&occ)?;
+        if self.pos == end {
+            self.locals.remove(&occ);
+            self.reg_to_local.remove("a0");
+            Some("a0".to_string())
+        } else {
+            None
         }
     }
 
