@@ -67,18 +67,97 @@ pub fn compute_df(cfg: &Cfg, idom: &[usize]) -> Vec<HashSet<usize>> {
 
 struct AllocaInfo {
     alloca_name: usize,
+    def_blocks: HashSet<usize>,
 }
 
 pub fn mem2reg(func: &mut IrFunc) -> bool {
-    if func.blocks.len() != 1 { return false; }
     let allocas = find_promotable_allocas(func);
     if allocas.is_empty() { return false; }
-    let mut changed = false;
-    for info in &allocas {
-        promote_single_block(func, info);
-        changed = true;
+
+    if func.blocks.len() == 1 {
+        // Single-block: simple forward substitution
+        let mut changed = false;
+        for info in &allocas {
+            promote_single_block(func, info);
+            changed = true;
+        }
+        return changed;
     }
-    changed
+
+    // Multi-block: only promote entry-block allocas whose stored value is
+    // NOT a parameter (params may be clobbered between blocks).
+    let entry_allocas: Vec<&AllocaInfo> = allocas.iter()
+        .filter(|a| {
+            if a.def_blocks.len() != 1 || !a.def_blocks.contains(&0) { return false; }
+            // Check: is the stored value a param? If so, skip.
+            let stored_is_param = func.blocks[0].instrs.iter().any(|inst| {
+                if let IrInst::Store { value, ptr } = inst {
+                    *ptr == IrOperand::Global(a.alloca_name)
+                        && matches!(value, IrOperand::Global(_))
+                } else { false }
+            });
+            !stored_is_param
+        })
+        .collect();
+    if entry_allocas.is_empty() { return false; }
+
+    // Use the multi-block rename pass with phi support
+    let n = func.blocks.len();
+    let mut new_blocks: Vec<IrBlock> = func.blocks.iter()
+        .map(|b| IrBlock { label: b.label, instrs: vec![], preds: b.preds.clone() })
+        .collect();
+
+    // For each entry-block alloca, forward the stored value to all loads
+    for info in &entry_allocas {
+        // Find the store instruction in block 0 and extract the value
+        let stored_val: Option<IrOperand> = func.blocks[0].instrs.iter()
+            .filter_map(|inst| {
+                if let IrInst::Store { value, ptr } = inst {
+                    if *ptr == IrOperand::Global(info.alloca_name) { Some(*value) }
+                    else { None }
+                } else { None }
+            })
+            .next();
+
+        let val = stored_val.unwrap_or(IrOperand::Int(0));
+
+        // Replace loads in all blocks with the stored value
+        for (bi, block) in func.blocks.iter().enumerate() {
+            for inst in &block.instrs {
+                match inst {
+                    IrInst::Alloc { dest, .. } if *dest == info.alloca_name => {}
+                    IrInst::Store { ptr, .. } if *ptr == IrOperand::Global(info.alloca_name) => {}
+                    IrInst::Load { dest, src } if *src == IrOperand::Global(info.alloca_name) => {
+                        new_blocks[bi].instrs.push(IrInst::Arith {
+                            dest: *dest, op: IrArithOp::Add,
+                            lhs: val, rhs: IrOperand::Int(0),
+                        });
+                    }
+                    _ => new_blocks[bi].instrs.push(inst.clone()),
+                }
+            }
+        }
+    }
+
+    // Copy blocks that weren't processed
+    for (bi, block) in func.blocks.iter().enumerate() {
+        if new_blocks[bi].instrs.is_empty() {
+            for inst in &block.instrs {
+                let mut skip = false;
+                for info in &entry_allocas {
+                    match inst {
+                        IrInst::Alloc { dest, .. } if *dest == info.alloca_name => skip = true,
+                        IrInst::Store { ptr, .. } if *ptr == IrOperand::Global(info.alloca_name) => skip = true,
+                        _ => {}
+                    }
+                }
+                if !skip { new_blocks[bi].instrs.push(inst.clone()); }
+            }
+        }
+    }
+
+    func.blocks = new_blocks;
+    true
 }
 
 fn find_promotable_allocas(func: &IrFunc) -> Vec<AllocaInfo> {
@@ -97,7 +176,7 @@ fn find_promotable_allocas(func: &IrFunc) -> Vec<AllocaInfo> {
                     }
                 }
                 if def_blocks.len() <= 1 {
-                    result.push(AllocaInfo { alloca_name: *dest });
+                    result.push(AllocaInfo { alloca_name: *dest, def_blocks });
                 }
             }
         }
