@@ -351,8 +351,22 @@ fn emit_inst(e: &mut RvEmitter, inst: &IrInst, frame: &FrameInfo, program: &IrPr
             let rv = tracked_op(e, *rhs, frame, program, "t1", param_regs, stack_param_offsets, param_spill, tracker, track);
             let ins = match op { IrArithOp::Add=>"add", IrArithOp::Sub=>"sub", IrArithOp::Mul=>"mul", IrArithOp::Div=>"div", IrArithOp::Mod=>"rem" };
             if track {
-                let (rd, evicted) = tracker.alloc();
-                if let Some(el) = evicted { if tracker.is_dirty(el) { emit_sw(e, &rd, lo(el)); } }
+                // Use a0 as dest only when lv is a0 AND the local in a0
+                // won't be needed again (last use is this instruction).
+                let a0_occ = tracker.local_in_reg("a0");
+                let use_a0 = lv == "a0" && a0_occ.map_or(true, |occ| {
+                    tracker.last_use.get(&occ).map_or(true, |&end| tracker.pos >= end)
+                });
+                let rd = if use_a0 {
+                    if let Some(old) = a0_occ {
+                        tracker.evict(old);
+                    }
+                    "a0".to_string()
+                } else {
+                    let (r, evicted) = tracker.alloc();
+                    if let Some(el) = evicted { if tracker.is_dirty(el) { emit_sw(e, &r, lo(el)); } }
+                    r
+                };
                 e.emit(&format!("  {ins} {rd}, {lv}, {rv}"));
                 tracker.set_dirty(*dest, rd);
             } else {

@@ -17,11 +17,11 @@ pub(crate) struct RegTracker {
     /// Available registers in preference order
     pool: Vec<String>,
     /// last-use position for each local (instruction index within block)
-    last_use: HashMap<usize, usize>,
+    pub last_use: HashMap<usize, usize>,
     /// first definition position for each local
     first_def: HashMap<usize, usize>,
     /// current instruction position in the block
-    pos: usize,
+    pub pos: usize,
     /// maximum number of simultaneously-live pool-register values
     pub max_pool_pressure: usize,
 }
@@ -144,23 +144,20 @@ impl RegTracker {
         }
     }
 
-    /// Try to get a0 as destination. Only succeeds if a0 is free or its
-    /// occupant's last use is at this position (will be consumed by the
-    /// instruction that uses a0 as both source and destination).
-    pub fn try_alloc_a0(&mut self) -> Option<String> {
-        if !self.reg_to_local.contains_key("a0") {
-            return Some("a0".to_string());
-        }
-        // a0 occupied — only take it if occupant dies exactly at this position
-        // (the instruction consuming it as a source operand)
-        let occ = self.reg_to_local.get("a0").copied()?;
-        let end = *self.last_use.get(&occ)?;
-        if self.pos == end {
+    /// Try to get a0 as destination. Returns None if a0 is occupied by
+    /// a live local. Otherwise returns Some((register, evicted_info)).
+    pub fn try_alloc_a0(&mut self) -> Option<(String, Option<(usize, bool)>)> {
+        if let Some(&occ) = self.reg_to_local.get("a0") {
+            let end = *self.last_use.get(&occ).unwrap_or(&usize::MAX);
+            if self.pos != end {
+                return None; // a0 occupied by live local
+            }
+            let dirty = self.is_dirty(occ);
             self.locals.remove(&occ);
             self.reg_to_local.remove("a0");
-            Some("a0".to_string())
+            Some(("a0".to_string(), Some((occ, dirty))))
         } else {
-            None
+            Some(("a0".to_string(), None)) // a0 is free
         }
     }
 
