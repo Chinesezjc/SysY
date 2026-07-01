@@ -130,8 +130,9 @@ pub fn mem2reg(func: &mut IrFunc) -> bool {
 
     if simple_allocas.is_empty() && phi_allocas.is_empty() { return false; }
 
-    // Step 1: Insert phi nodes for phi_allocas
+    // Step 1: Insert phi nodes (before rename so incomings can be filled)
     let mut phi_nodes: Vec<HashMap<usize, usize>> = vec![HashMap::new(); n];
+    let mut fresh_cnt: usize = 0;
     for &alloca in &phi_allocas {
         let info = allocas.iter().find(|a| a.alloca_name == alloca).unwrap();
         let mut worklist: Vec<usize> = info.def_blocks.iter().copied().collect();
@@ -139,7 +140,7 @@ pub fn mem2reg(func: &mut IrFunc) -> bool {
         while let Some(b) = worklist.pop() {
             for &d in &df[b] {
                 if !has_phi.contains(&d) {
-                    let phi_dest = fresh_local(func);
+                    let phi_dest = fresh_local(func, &mut fresh_cnt);
                     phi_nodes[d].insert(alloca, phi_dest);
                     has_phi.insert(d);
                     worklist.push(d);
@@ -148,14 +149,20 @@ pub fn mem2reg(func: &mut IrFunc) -> bool {
         }
     }
 
-    // Step 2: Rename — walk dominator tree
-    let mut stacks: HashMap<usize, Vec<IrOperand>> = HashMap::new();
-    for &alloca in &phi_allocas { stacks.insert(alloca, Vec::new()); }
-    for (info, _) in &simple_allocas { stacks.insert(info.alloca_name, Vec::new()); }
-
+    // Pre-insert phi instructions into new_blocks (empty incoming)
     let mut new_blocks: Vec<IrBlock> = func.blocks.iter()
         .map(|b| IrBlock { label: b.label, instrs: vec![], preds: b.preds.clone() })
         .collect();
+    for bi in 0..n {
+        for (&_alloca, &phi_dest) in &phi_nodes[bi] {
+            new_blocks[bi].instrs.push(IrInst::Phi { dest: phi_dest, incoming: Vec::new() });
+        }
+    }
+
+    // Step 2: Rename — fill incomings + rewrite Load/Store
+    let mut stacks: HashMap<usize, Vec<IrOperand>> = HashMap::new();
+    for &alloca in &phi_allocas { stacks.insert(alloca, Vec::new()); }
+    for (info, _) in &simple_allocas { stacks.insert(info.alloca_name, Vec::new()); }
 
     let all_promoted: HashSet<usize> = phi_allocas.iter().copied()
         .chain(simple_allocas.iter().map(|(a, _)| a.alloca_name))
@@ -209,11 +216,10 @@ fn rename_multi(
     let mut pushed_phi: Vec<usize> = Vec::new();
     let mut pushed_store: Vec<usize> = Vec::new();
 
-    // 1. Define phi values
+    // 1. Define phi values (phis already inserted in new_blocks pre-pass)
     for (&alloca, &phi_dest) in &phi_nodes[b] {
         stacks.get_mut(&alloca).unwrap().push(IrOperand::Local(phi_dest));
         pushed_phi.push(alloca);
-        new[b].instrs.push(IrInst::Phi { dest: phi_dest, incoming: Vec::new() });
     }
 
     // 2. Rewrite
@@ -284,11 +290,7 @@ fn find_promotable_allocas(func: &IrFunc) -> Vec<AllocaInfo> {
                         }
                     }
                 }
-                // Skip multi-def allocas for now — phi promotion interacts
-                // with @sc_ allocas in ways that need more debugging.
-                if def_blocks.len() <= 1 {
-                    result.push(AllocaInfo { alloca_name: *dest, def_blocks });
-                }
+                result.push(AllocaInfo { alloca_name: *dest, def_blocks });
             }
         }
     }
@@ -343,13 +345,18 @@ fn build_dominates(cfg: &Cfg, idom: &[usize]) -> Vec<Vec<bool>> {
     dom
 }
 
-fn fresh_local(func: &IrFunc) -> usize {
-    let mut max: usize = 0;
-    for b in &func.blocks { for i in &b.instrs {
-        if let Some(d) = i.dest() { max = max.max(d); }
-        for op in i.operands() { if let IrOperand::Local(l) = *op { max = max.max(l); } }
-    }}
-    max + 1
+fn fresh_local(func: &IrFunc, counter: &mut usize) -> usize {
+    if *counter == 0 {
+        let mut max: usize = 0;
+        for b in &func.blocks { for i in &b.instrs {
+            if let Some(d) = i.dest() { max = max.max(d); }
+            for op in i.operands() { if let IrOperand::Local(l) = *op { max = max.max(l); } }
+        }}
+        *counter = max + 1;
+    }
+    let val = *counter;
+    *counter += 1;
+    val
 }
 
 // ── Phi lowering ────────────────────────────────────────────────────────────
