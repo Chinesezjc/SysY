@@ -300,16 +300,16 @@ fn emit_inst(e: &mut RvEmitter, inst: &IrInst, frame: &FrameInfo, program: &IrPr
         IrInst::Alloc { .. } => {}
 
         IrInst::Load { dest, src } => {
+            // Spill t0 BEFORE load — the load will overwrite t0
+            if track { spill_reg(e, "t0", frame, tracker); }
             let off = alloca_offset(*src, frame);
             if let Some(off) = off {
-                // Direct sp-relative load (saves addi instruction)
                 emit_lw(e, "t0", off);
             } else {
                 let addr = tracked_op(e, *src, frame, program, "t2", param_regs, stack_param_offsets, param_spill, tracker, track);
                 e.emit(&format!("  lw t0, 0({addr})"));
             }
             if track {
-                spill_reg(e, "t0", frame, tracker);
                 tracker.set_dirty(*dest, "t0".to_string());
             } else {
                 emit_sw(e, "t0", lo(*dest));
