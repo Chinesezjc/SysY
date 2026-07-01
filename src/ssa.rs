@@ -101,8 +101,16 @@ pub fn mem2reg(func: &mut IrFunc) -> bool {
     let mut simple_allocas: Vec<(&AllocaInfo, IrOperand)> = Vec::new();
 
     for info in &allocas {
+        // Check if stored value is a param (Global) — skip promotion
+        let stored_is_param = func.blocks[0].instrs.iter().any(|inst| {
+            if let IrInst::Store { value, ptr } = inst {
+                *ptr == IrOperand::Global(info.alloca_name) && matches!(value, IrOperand::Global(_))
+            } else { false }
+        });
+        if stored_is_param { continue; }
+
         if info.def_blocks.len() == 1 && info.def_blocks.contains(&0) {
-            // Entry-block single-def: check non-param
+            // Entry-block single-def: constant/expression init
             let stored_val = func.blocks[0].instrs.iter().find_map(|inst| {
                 if let IrInst::Store { value, ptr } = inst {
                     if *ptr == IrOperand::Global(info.alloca_name) { Some(*value) }
@@ -110,14 +118,11 @@ pub fn mem2reg(func: &mut IrFunc) -> bool {
                 } else { None }
             });
             if let Some(val) = stored_val {
-                if !matches!(val, IrOperand::Global(_)) {
-                    simple_allocas.push((info, val));
-                    continue;
-                }
+                simple_allocas.push((info, val));
+                continue;
             }
         }
         // Multi-def with dominant chain → phi promotion candidate.
-        // Skip if function has Call or array allocas (complex interactions).
         let has_arrays_or_calls = func.blocks.iter().any(|b| b.instrs.iter().any(|i| {
             matches!(i, IrInst::Call{..}) || matches!(i, IrInst::Alloc { ty: IrType::Array(..), .. })
         }));
