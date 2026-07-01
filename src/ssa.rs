@@ -116,9 +116,12 @@ pub fn mem2reg(func: &mut IrFunc) -> bool {
                 }
             }
         }
-        // Multi-def with dominant chain → phi promotion candidate
-        if info.def_blocks.len() >= 2 {
-            // Check: does any def block dominate another?
+        // Multi-def with dominant chain → phi promotion candidate.
+        // Skip if function has Call or array allocas (complex interactions).
+        let has_arrays_or_calls = func.blocks.iter().any(|b| b.instrs.iter().any(|i| {
+            matches!(i, IrInst::Call{..}) || matches!(i, IrInst::Alloc { ty: IrType::Array(..), .. })
+        }));
+        if info.def_blocks.len() >= 2 && !has_arrays_or_calls {
             let has_dom = info.def_blocks.iter().any(|&d1|
                 info.def_blocks.iter().any(|&d2| d1 != d2 && dom[d1][d2])
             );
@@ -352,7 +355,8 @@ fn fresh_local(func: &IrFunc, counter: &mut usize) -> usize {
             if let Some(d) = i.dest() { max = max.max(d); }
             for op in i.operands() { if let IrOperand::Local(l) = *op { max = max.max(l); } }
         }}
-        *counter = max + 1;
+        // Use a safe base well above any existing local index
+        *counter = (max + 1).max(1000);
     }
     let val = *counter;
     *counter += 1;
