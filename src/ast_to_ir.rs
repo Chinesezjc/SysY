@@ -498,20 +498,29 @@ impl AstToIr {
             Some((base, _is_ptr)) if is_ndparam => {
                 let val = self.gen_expr(expr)?;
                 let first = self.gen_expr(&indices[0])?;
-                let mut ptr = self.b().emit_getptr(IrOperand::Global(base), first, 4);
-                for idx in &indices[1..] {
+                let dims = match self.lookup(name) {
+                    Some(IrSymbol::NdParam { dims, .. }) => dims.clone(),
+                    _ => vec![],
+                };
+                let first_stride: i32 = if dims.is_empty() { 4 } else { dims.iter().product::<i32>().max(1) * 4 };
+                let mut ptr = self.b().emit_getptr(IrOperand::Global(base), first, first_stride);
+                for (di, idx) in indices[1..].iter().enumerate() {
                     let iv = self.gen_expr(idx)?;
-                    ptr = self.b().emit_getelemptr(ptr, iv, 4);
+                    let stride: i32 = if di + 1 < dims.len() { dims[di+1..].iter().product::<i32>().max(1) * 4 } else { 4 };
+                    ptr = self.b().emit_getelemptr(ptr, iv, stride);
                 }
                 self.b().emit_store(val, ptr);
             }
             Some((base, is_ptr)) => {
                 let val = self.gen_expr(expr)?;
                 let mut ptr = IrOperand::Global(base);
+                let mut num_before = 0;
                 for idx in indices {
                     let iv = self.gen_expr(idx)?;
-                    ptr = if is_ptr { self.b().emit_getptr(ptr, iv, 4) }
-                          else { let p0 = self.b().emit_getelemptr(ptr, IrOperand::Int(0), 4); self.b().emit_getptr(p0, iv, 4) };
+                    let stride = self.get_stride_at(&Expr::LVal(name.to_string()), num_before);
+                    ptr = if is_ptr { self.b().emit_getptr(ptr, iv, stride) }
+                          else { let p0 = self.b().emit_getelemptr(ptr, IrOperand::Int(0), stride); self.b().emit_getptr(p0, iv, stride) };
+                    num_before += 1;
                 }
                 self.b().emit_store(val, ptr);
             }
