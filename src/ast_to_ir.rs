@@ -884,14 +884,67 @@ impl AstToIr {
 
     fn gen_array_init(&mut self, base_idx: usize, dims: &[i32], init: &Expr) -> CompilerResult<()> {
         let mut flat_vals: Vec<i32> = Vec::new();
-        Self::flatten_init_vals(dims, init, &mut flat_vals);
+        let mut expr_items: Vec<(usize, Expr)> = Vec::new();
+        Self::flatten_init_vals_expr(dims, init, &mut flat_vals, &mut expr_items, 0);
         let total: usize = dims.iter().map(|&d| d as usize).product();
         while flat_vals.len() < total { flat_vals.push(0); }
+        // Store constant values
         for (i, val) in flat_vals.iter().enumerate().take(total) {
             let ptr = self.emit_array_elem_ptr(base_idx, dims, i as i32);
             self.b().emit_store(IrOperand::Int(*val), ptr);
         }
+        // Store runtime expressions (overwrites constants at those positions)
+        for (flat_idx, expr) in &expr_items {
+            let val = self.gen_expr(expr)?;
+            let ptr = self.emit_array_elem_ptr(base_idx, dims, *flat_idx as i32);
+            self.b().emit_store(val, ptr);
+        }
         Ok(())
+    }
+
+    fn flatten_init_vals_expr(
+        dims: &[i32], init: &Expr, vals: &mut Vec<i32>,
+        exprs: &mut Vec<(usize, Expr)>, base_flat: usize,
+    ) {
+        if dims.is_empty() {
+            if let Expr::Int(n) = init { vals.push(*n); }
+            else { vals.push(0); exprs.push((base_flat, init.clone())); }
+            return;
+        }
+        let start_len = vals.len();
+        let total: usize = dims.iter().map(|&d| d as usize).product();
+        let inner_dim = *dims.last().unwrap_or(&1) as usize;
+        let sub_dims: &[i32] = if dims.len() > 1 { &dims[1..] } else { &[] };
+        let sub_total: usize = sub_dims.iter().map(|&d| d as usize).product();
+        match init {
+            Expr::InitList(items) => {
+                for item in items {
+                    match item {
+                        Expr::InitList(_) => {
+                            let rem = (inner_dim - (vals.len() - start_len) % inner_dim) % inner_dim;
+                            for _ in 0..rem { vals.push(0); }
+                            let sub_start = vals.len();
+                            let flat_base = base_flat + (vals.len() - start_len);
+                            Self::flatten_init_vals_expr(sub_dims, item, vals, exprs, flat_base);
+                            let target = sub_start + if sub_dims.is_empty() { inner_dim } else { sub_total };
+                            while vals.len() < target { vals.push(0); }
+                        }
+                        Expr::Int(n) => vals.push(*n),
+                        _ => {
+                            vals.push(0);
+                            exprs.push((base_flat + (vals.len() - 1 - start_len), item.clone()));
+                        }
+                    }
+                }
+                while vals.len() < start_len + total { vals.push(0); }
+            }
+            Expr::Int(n) => { vals.push(*n); while vals.len() < start_len + total { vals.push(0); } }
+            _ => {
+                vals.push(0);
+                exprs.push((base_flat, init.clone()));
+                while vals.len() < start_len + total { vals.push(0); }
+            }
+        }
     }
 
     fn flatten_init_vals(dims: &[i32], init: &Expr, vals: &mut Vec<i32>) {
