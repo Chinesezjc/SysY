@@ -1,5 +1,6 @@
 use crate::ast_to_ir;
 use crate::ir::IrProgram;
+use crate::ir::IrOperand;
 use crate::ir_to_koopa;
 use crate::ir_to_riscv;
 use crate::opt::{self, IrFuncPass, IrProgramPass};
@@ -30,6 +31,21 @@ fn compile_to_ir(program: &CompUnit) -> CompilerResult<IrProgram> {
     pm.add_func_pass(Box::new(opt::dce::DeadCodeElim));
     pm.add_func_pass(Box::new(opt::gvn::GVN));
     pm.run(&mut ir);
+    // Find max local index and extend name table for phi/rename locals
+    let mut max_local = 0usize;
+    for func in &ir.funcs {
+        for block in &func.blocks {
+            for inst in &block.instrs {
+                if let Some(d) = inst.dest() { max_local = max_local.max(d); }
+                for op in inst.operands() {
+                    if let IrOperand::Local(l) = *op { max_local = max_local.max(l); }
+                }
+            }
+        }
+    }
+    while ir.local_names.len() <= max_local {
+        ir.local_names.push(format!("%{}", ir.local_names.len()));
+    }
     // Lower phi nodes before RISC-V emission
     for func in &mut ir.funcs {
         ssa::lower_phis(func);

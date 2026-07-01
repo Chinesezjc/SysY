@@ -74,8 +74,8 @@ pub fn mem2reg(func: &mut IrFunc) -> bool {
     let allocas = find_promotable_allocas(func);
     if allocas.is_empty() { return false; }
 
+    // Single-block: simple forward substitution
     if func.blocks.len() == 1 {
-        // Single-block: simple forward substitution
         let mut changed = false;
         for info in &allocas {
             promote_single_block(func, info);
@@ -84,80 +84,189 @@ pub fn mem2reg(func: &mut IrFunc) -> bool {
         return changed;
     }
 
-    // Multi-block: only promote entry-block allocas whose stored value is
-    // NOT a parameter (params may be clobbered between blocks).
-    let entry_allocas: Vec<&AllocaInfo> = allocas.iter()
-        .filter(|a| {
-            if a.def_blocks.len() != 1 || !a.def_blocks.contains(&0) { return false; }
-            // Check: is the stored value a param? If so, skip.
-            let stored_is_param = func.blocks[0].instrs.iter().any(|inst| {
-                if let IrInst::Store { value, ptr } = inst {
-                    *ptr == IrOperand::Global(a.alloca_name)
-                        && matches!(value, IrOperand::Global(_))
-                } else { false }
-            });
-            !stored_is_param
-        })
-        .collect();
-    if entry_allocas.is_empty() { return false; }
-
-    // Use the multi-block rename pass with phi support
+    // Multi-block: classify allocas
     let n = func.blocks.len();
-    let mut new_blocks: Vec<IrBlock> = func.blocks.iter()
-        .map(|b| IrBlock { label: b.label, instrs: vec![], preds: b.preds.clone() })
-        .collect();
+    let cfg = Cfg::build(func);
+    let idom = compute_idom(&cfg);
+    let dom = build_dominates(&cfg, &idom);
+    let df = compute_df(&cfg, &idom);
+    let dom_children = dom_tree_children(&idom);
 
-    // For each entry-block alloca, forward the stored value to all loads
-    for info in &entry_allocas {
-        // Find the store instruction in block 0 and extract the value
-        let stored_val: Option<IrOperand> = func.blocks[0].instrs.iter()
-            .filter_map(|inst| {
+    // Build successor lists
+    let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for b in 0..n { for &p in &cfg.predecessors[b] { succ[p].push(b); } }
+
+    // Classify: single-def → phi-free promotion; multi-def with dominant chain → phi
+    let mut phi_allocas: Vec<usize> = Vec::new();
+    let mut simple_allocas: Vec<(&AllocaInfo, IrOperand)> = Vec::new();
+
+    for info in &allocas {
+        if info.def_blocks.len() == 1 && info.def_blocks.contains(&0) {
+            // Entry-block single-def: check non-param
+            let stored_val = func.blocks[0].instrs.iter().find_map(|inst| {
                 if let IrInst::Store { value, ptr } = inst {
                     if *ptr == IrOperand::Global(info.alloca_name) { Some(*value) }
                     else { None }
                 } else { None }
-            })
-            .next();
+            });
+            if let Some(val) = stored_val {
+                if !matches!(val, IrOperand::Global(_)) {
+                    simple_allocas.push((info, val));
+                    continue;
+                }
+            }
+        }
+        // Multi-def with dominant chain → phi promotion candidate
+        if info.def_blocks.len() >= 2 {
+            // Check: does any def block dominate another?
+            let has_dom = info.def_blocks.iter().any(|&d1|
+                info.def_blocks.iter().any(|&d2| d1 != d2 && dom[d1][d2])
+            );
+            if has_dom {
+                phi_allocas.push(info.alloca_name);
+            }
+        }
+    }
 
-        let val = stored_val.unwrap_or(IrOperand::Int(0));
+    if simple_allocas.is_empty() && phi_allocas.is_empty() { return false; }
 
-        // Replace loads in all blocks with the stored value
-        for (bi, block) in func.blocks.iter().enumerate() {
-            for inst in &block.instrs {
-                match inst {
-                    IrInst::Alloc { dest, .. } if *dest == info.alloca_name => {}
-                    IrInst::Store { ptr, .. } if *ptr == IrOperand::Global(info.alloca_name) => {}
-                    IrInst::Load { dest, src } if *src == IrOperand::Global(info.alloca_name) => {
-                        new_blocks[bi].instrs.push(IrInst::Arith {
-                            dest: *dest, op: IrArithOp::Add,
-                            lhs: val, rhs: IrOperand::Int(0),
-                        });
-                    }
-                    _ => new_blocks[bi].instrs.push(inst.clone()),
+    // Step 1: Insert phi nodes for phi_allocas
+    let mut phi_nodes: Vec<HashMap<usize, usize>> = vec![HashMap::new(); n];
+    for &alloca in &phi_allocas {
+        let info = allocas.iter().find(|a| a.alloca_name == alloca).unwrap();
+        let mut worklist: Vec<usize> = info.def_blocks.iter().copied().collect();
+        let mut has_phi: HashSet<usize> = HashSet::new();
+        while let Some(b) = worklist.pop() {
+            for &d in &df[b] {
+                if !has_phi.contains(&d) {
+                    let phi_dest = fresh_local(func);
+                    phi_nodes[d].insert(alloca, phi_dest);
+                    has_phi.insert(d);
+                    worklist.push(d);
                 }
             }
         }
     }
 
-    // Copy blocks that weren't processed
-    for (bi, block) in func.blocks.iter().enumerate() {
-        if new_blocks[bi].instrs.is_empty() {
-            for inst in &block.instrs {
-                let mut skip = false;
-                for info in &entry_allocas {
-                    match inst {
-                        IrInst::Alloc { dest, .. } if *dest == info.alloca_name => skip = true,
-                        IrInst::Store { ptr, .. } if *ptr == IrOperand::Global(info.alloca_name) => skip = true,
-                        _ => {}
+    // Step 2: Rename — walk dominator tree
+    let mut stacks: HashMap<usize, Vec<IrOperand>> = HashMap::new();
+    for &alloca in &phi_allocas { stacks.insert(alloca, Vec::new()); }
+    for (info, _) in &simple_allocas { stacks.insert(info.alloca_name, Vec::new()); }
+
+    let mut new_blocks: Vec<IrBlock> = func.blocks.iter()
+        .map(|b| IrBlock { label: b.label, instrs: vec![], preds: b.preds.clone() })
+        .collect();
+
+    let all_promoted: HashSet<usize> = phi_allocas.iter().copied()
+        .chain(simple_allocas.iter().map(|(a, _)| a.alloca_name))
+        .collect();
+
+    rename_multi(0, &func.blocks, &dom_children, &succ, &phi_nodes,
+        &mut stacks, &mut new_blocks, &all_promoted);
+
+    // Step 3: Apply simple_allocas (replace loads with known value)
+    for (info, val) in &simple_allocas {
+        for bi in 0..n {
+            let mut new_instrs = Vec::new();
+            for inst in &new_blocks[bi].instrs {
+                match inst {
+                    IrInst::Load { dest, src } if *src == IrOperand::Global(info.alloca_name) => {
+                        new_instrs.push(IrInst::Arith {
+                            dest: *dest, op: IrArithOp::Add, lhs: *val, rhs: IrOperand::Int(0),
+                        });
                     }
+                    _ => new_instrs.push(inst.clone()),
                 }
-                if !skip { new_blocks[bi].instrs.push(inst.clone()); }
             }
+            new_blocks[bi].instrs = new_instrs;
         }
+    }
+
+    // Remove Alloc/Store for promoted allocas
+    for bi in 0..n {
+        new_blocks[bi].instrs.retain(|inst| {
+            match inst {
+                IrInst::Alloc { dest, .. } => !all_promoted.contains(dest),
+                IrInst::Store { ptr, .. } => {
+                    if let IrOperand::Global(g) = *ptr { !all_promoted.contains(&g) }
+                    else { true }
+                }
+                _ => true,
+            }
+        });
     }
 
     func.blocks = new_blocks;
     true
+}
+
+/// Multi-block rename pass (handles phi nodes + simple Load/Store).
+fn rename_multi(
+    b: usize, old: &[IrBlock], dom_ch: &[Vec<usize>], succ: &[Vec<usize>],
+    phi_nodes: &[HashMap<usize, usize>], stacks: &mut HashMap<usize, Vec<IrOperand>>,
+    new: &mut [IrBlock], promoted: &HashSet<usize>,
+) {
+    let mut pushed_phi: Vec<usize> = Vec::new();
+    let mut pushed_store: Vec<usize> = Vec::new();
+
+    // 1. Define phi values
+    for (&alloca, &phi_dest) in &phi_nodes[b] {
+        stacks.get_mut(&alloca).unwrap().push(IrOperand::Local(phi_dest));
+        pushed_phi.push(alloca);
+        new[b].instrs.push(IrInst::Phi { dest: phi_dest, incoming: Vec::new() });
+    }
+
+    // 2. Rewrite
+    for inst in &old[b].instrs {
+        match inst {
+            IrInst::Store { value, ptr } => {
+                if let IrOperand::Global(g) = *ptr {
+                    if promoted.contains(&g) {
+                        stacks.get_mut(&g).unwrap().push(*value);
+                        pushed_store.push(g);
+                        continue;
+                    }
+                }
+                new[b].instrs.push(inst.clone());
+            }
+            IrInst::Load { dest, src } => {
+                if let IrOperand::Global(g) = *src {
+                    if promoted.contains(&g) {
+                        let v = stacks.get(&g).and_then(|s| s.last().copied())
+                            .unwrap_or(IrOperand::Undef);
+                        new[b].instrs.push(IrInst::Arith {
+                            dest: *dest, op: IrArithOp::Add, lhs: v, rhs: IrOperand::Int(0),
+                        });
+                        continue;
+                    }
+                }
+                new[b].instrs.push(inst.clone());
+            }
+            _ => new[b].instrs.push(inst.clone()),
+        }
+    }
+
+    // 3. Fill phi incoming in successors
+    for &s in &succ[b] {
+        for (&alloca, &phi_dest) in &phi_nodes[s] {
+            let cur = stacks.get(&alloca).and_then(|s| s.last().copied())
+                .unwrap_or(IrOperand::Undef);
+            for inst in &mut new[s].instrs {
+                if let IrInst::Phi { dest, incoming } = inst {
+                    if *dest == phi_dest { incoming.push((cur, b)); break; }
+                }
+            }
+        }
+    }
+
+    // 4. Recurse
+    for &child in &dom_ch[b] {
+        rename_multi(child, old, dom_ch, succ, phi_nodes, stacks, new, promoted);
+    }
+
+    // 5. Pop
+    for _ in 0..pushed_store.len() { let a = pushed_store.pop().unwrap(); stacks.get_mut(&a).unwrap().pop(); }
+    for _ in 0..pushed_phi.len() { let a = pushed_phi.pop().unwrap(); stacks.get_mut(&a).unwrap().pop(); }
 }
 
 fn find_promotable_allocas(func: &IrFunc) -> Vec<AllocaInfo> {
@@ -175,6 +284,8 @@ fn find_promotable_allocas(func: &IrFunc) -> Vec<AllocaInfo> {
                         }
                     }
                 }
+                // Skip multi-def allocas for now — phi promotion interacts
+                // with @sc_ allocas in ways that need more debugging.
                 if def_blocks.len() <= 1 {
                     result.push(AllocaInfo { alloca_name: *dest, def_blocks });
                 }
@@ -218,6 +329,27 @@ fn promote_single_block(func: &mut IrFunc, info: &AllocaInfo) {
         new_blocks.push(IrBlock { label: block.label, instrs: new_instrs, preds: block.preds.clone() });
     }
     func.blocks = new_blocks;
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+fn build_dominates(cfg: &Cfg, idom: &[usize]) -> Vec<Vec<bool>> {
+    let n = cfg.len();
+    let mut dom = vec![vec![false; n]; n];
+    for i in 0..n {
+        let mut cur = i;
+        loop { dom[cur][i] = true; if cur == 0 { break; } cur = idom[cur]; }
+    }
+    dom
+}
+
+fn fresh_local(func: &IrFunc) -> usize {
+    let mut max: usize = 0;
+    for b in &func.blocks { for i in &b.instrs {
+        if let Some(d) = i.dest() { max = max.max(d); }
+        for op in i.operands() { if let IrOperand::Local(l) = *op { max = max.max(l); } }
+    }}
+    max + 1
 }
 
 // ── Phi lowering ────────────────────────────────────────────────────────────
