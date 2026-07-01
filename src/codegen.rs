@@ -50,6 +50,22 @@ fn compile_to_ir(program: &CompUnit) -> CompilerResult<IrProgram> {
     for func in &mut ir.funcs {
         ssa::lower_phis(func);
     }
+    // Extend frame for new phi-generated locals (they need stack slots)
+    // Find max local again after phi lowering (copies add more locals)
+    let mut max_after = max_local;
+    for func in &ir.funcs {
+        for block in &func.blocks {
+            for inst in &block.instrs {
+                if let Some(d) = inst.dest() { max_after = max_after.max(d); }
+                for op in inst.operands() {
+                    if let IrOperand::Local(l) = *op { max_after = max_after.max(l); }
+                }
+            }
+        }
+    }
+    while ir.local_names.len() <= max_after {
+        ir.local_names.push(format!("%{}", ir.local_names.len()));
+    }
     Ok(ir)
 }
 

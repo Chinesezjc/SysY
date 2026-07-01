@@ -201,16 +201,18 @@ fn emit_function(e: &mut RvEmitter, func: &IrFunc, program: &IrProgram) {
         }
     }
     // Frame is needed if:
-    // - Non-leaf (calls other functions — need ra save + arg spill area)
-    // - Has array allocas (need fixed stack storage)
-    // - Has array params (param_spill entries — need frame for pointer storage)
-    // - Has >8 params (stack args need frame-relative addressing)
-    // - Pool pressure exceeds capacity (need spill slots)
+    // - Non-leaf (ra must be saved)
+    // - Has array allocas (fixed stack storage)
+    // - Has array params (param_spill entries)
+    // - Has >8 params (stack arg addressing)
+    // - Pool pressure exceeds capacity (spill slots)
+    // - Frame has non-zero size (local temps exist, incl. phi dummies)
     let needs_frame = !is_leaf
         || frame.alloca_offsets.len() > 0
         || param_spill.len() > 0
         || func.params.len() > 8
-        || (single_block && tracker.max_pool_pressure > 3);
+        || (single_block && tracker.max_pool_pressure > 3)
+        || (!single_block && tf > 0); // multi-block always needs frame for locals
 
     e.emit(&format!("  .globl {fn_name}")); e.emit_label(fn_name);
 
