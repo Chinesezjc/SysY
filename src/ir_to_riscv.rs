@@ -434,27 +434,21 @@ fn emit_inst(e: &mut RvEmitter, inst: &IrInst, frame: &FrameInfo, program: &IrPr
             }
         }
         IrInst::GetPtr { dest, ptr, index, elem_size } => {
-            let base = tracked_op(e, *ptr, frame, program, "t0", param_regs, stack_param_offsets, param_spill, tracker, track);
+            // Eval index first: if it clobbers base's register, base reloads from stack.
             let idx = tracked_op(e, *index, frame, program, "t1", param_regs, stack_param_offsets, param_spill, tracker, track);
+            let base = tracked_op(e, *ptr, frame, program, "t0", param_regs, stack_param_offsets, param_spill, tracker, track);
             emit_offset_mul(e, *elem_size, format!("t1"), &idx);
             e.emit(&format!("  add t0, {base}, t1"));
-            if track {
-                // Virtual register: t0 IS the primary storage
-                tracker.set_dirty(*dest, "t0".to_string());
-            } else {
-                emit_sw(e, "t0", lo(*dest));
-            }
+            if track { tracker.set_dirty(*dest, "t0".to_string()); }
+            else { emit_sw(e, "t0", lo(*dest)); }
         }
         IrInst::GetElemPtr { dest, ptr, index, elem_size } => {
-            let base = tracked_op(e, *ptr, frame, program, "t0", param_regs, stack_param_offsets, param_spill, tracker, track);
             let idx = tracked_op(e, *index, frame, program, "t1", param_regs, stack_param_offsets, param_spill, tracker, track);
+            let base = tracked_op(e, *ptr, frame, program, "t0", param_regs, stack_param_offsets, param_spill, tracker, track);
             emit_offset_mul(e, *elem_size, format!("t1"), &idx);
             e.emit(&format!("  add t0, {base}, t1"));
-            if track {
-                tracker.set_dirty(*dest, "t0".to_string());
-            } else {
-                emit_sw(e, "t0", lo(*dest));
-            }
+            if track { tracker.set_dirty(*dest, "t0".to_string()); }
+            else { emit_sw(e, "t0", lo(*dest)); }
         }
         IrInst::Call { dest, func, args } => {
             let callee = program.func_name(*func).strip_prefix('@').unwrap_or(program.func_name(*func)).to_string();
