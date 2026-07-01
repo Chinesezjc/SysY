@@ -124,7 +124,7 @@ pub fn mem2reg(func: &mut IrFunc) -> bool {
         }
         // Multi-def with dominant chain → phi promotion candidate.
         let has_arrays_or_calls = func.blocks.iter().any(|b| b.instrs.iter().any(|i| {
-            matches!(i, IrInst::Call{..}) || matches!(i, IrInst::Alloc { ty: IrType::Array(..), .. })
+            matches!(i, IrInst::Call{..}) || matches!(i, IrInst::Alloc { ty: IrType::Array(..), .. }) || matches!(i, IrInst::GetPtr{..}) || matches!(i, IrInst::GetElemPtr{..})
         }));
         if info.def_blocks.len() >= 2 && !has_arrays_or_calls {
             let has_dom = info.def_blocks.iter().any(|&d1|
