@@ -318,12 +318,15 @@ fn emit_inst(e: &mut RvEmitter, inst: &IrInst, frame: &FrameInfo, program: &IrPr
             }
         }
         IrInst::Store { value, ptr } => {
-            let val = tracked_op(e, *value, frame, program, "t1", param_regs, stack_param_offsets, param_spill, tracker, track);
+            // Eval ptr BEFORE value: if ptr clobbers value's register,
+            // value's tracked_op will reload from stack.
             let off = alloca_offset(*ptr, frame);
             if let Some(off) = off {
+                let val = tracked_op(e, *value, frame, program, "t1", param_regs, stack_param_offsets, param_spill, tracker, track);
                 emit_sw(e, &val, off);
             } else {
                 let p = tracked_op(e, *ptr, frame, program, "t2", param_regs, stack_param_offsets, param_spill, tracker, track);
+                let val = tracked_op(e, *value, frame, program, "t1", param_regs, stack_param_offsets, param_spill, tracker, track);
                 e.emit(&format!("  sw {val}, 0({p})"));
             }
         }
