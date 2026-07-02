@@ -234,18 +234,62 @@ fn emit_function(e: &mut RvEmitter, func: &IrFunc, program: &IrProgram) {
     let mut block_labels: HashMap<usize, String> = HashMap::new();
     for block in &func.blocks { block_labels.insert(block.label, e.fresh_label()); }
 
-    // Emit blocks
+    // Emit blocks — with tail-call detection for self-recursive functions
+    let entry_label = block_labels.get(&func.blocks[0].label).cloned().unwrap_or_default();
+    let self_name = program.func_name(func.name);
     for block in &func.blocks {
         e.emit_label(&block_labels[&block.label]);
         if !single_block { tracker.clear(); }
-        for (i, inst) in block.instrs.iter().enumerate() {
+        let instrs = &block.instrs;
+        let mut i = 0;
+        while i < instrs.len() {
+            let inst = &instrs[i];
             if single_block {
                 for (local, reg) in tracker.advance(i) {
                     let off = frame.local_offsets.get(&local).copied().unwrap_or(0);
                     emit_sw(e, &reg, off);
                 }
             }
-            emit_inst(e, inst, &frame, program, &block_labels, &param_regs, &stack_param_offsets, &param_spill, &mut tracker, single_block, is_leaf, needs_frame);
+            // Tail-call: Call(dest) immediately followed by Ret(dest) to same function?
+            let mut emitted_tail_call = false;
+            if let IrInst::Call { dest: Some(cd), func: callee, args } = inst {
+                if i + 1 < instrs.len() {
+                    if let IrInst::Ret { value: Some(IrOperand::Local(rv)) } = &instrs[i + 1] {
+                        if *cd == *rv && program.func_name(*callee) == self_name {
+                            // Self-recursive tail call: emit jump instead of call.
+                            // Flush dirty registers (caller-saved convention).
+                            if single_block {
+                                let dirty: Vec<(usize, String)> = tracker.locals.iter()
+                                    .filter(|(_, (_, d))| *d)
+                                    .map(|(l, (r, _))| (*l, r.clone()))
+                                    .collect();
+                                for (local, reg) in dirty {
+                                    let off = frame.local_offsets.get(&local).copied().unwrap_or(0);
+                                    emit_sw(e, &reg, off);
+                                    tracker.evict(local);
+                                }
+                            }
+                            // Overwrite argument registers
+                            let arg_regs = ["a0","a1","a2","a3","a4","a5","a6","a7"];
+                            for (j, arg) in args.iter().enumerate() {
+                                if j >= 8 { break; }
+                                let val = op_to_reg(e, *arg, &frame, program, arg_regs[j], &param_regs, &stack_param_offsets, &param_spill);
+                                if val != arg_regs[j] {
+                                    e.emit(&format!("  mv {}, {val}", arg_regs[j]));
+                                }
+                            }
+                            e.emit(&format!("  j {entry_label}"));
+                            emitted_tail_call = true;
+                        }
+                    }
+                }
+            }
+            if !emitted_tail_call {
+                emit_inst(e, inst, &frame, program, &block_labels, &param_regs, &stack_param_offsets, &param_spill, &mut tracker, single_block, is_leaf, needs_frame);
+            } else {
+                i += 1; // skip the trailing Ret
+            }
+            i += 1;
         }
     }
 
