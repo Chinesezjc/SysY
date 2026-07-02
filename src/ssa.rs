@@ -126,7 +126,7 @@ pub fn mem2reg(func: &mut IrFunc) -> bool {
         let has_arrays_or_calls = func.blocks.iter().any(|b| b.instrs.iter().any(|i| {
             matches!(i, IrInst::Call{..}) || matches!(i, IrInst::Alloc { ty: IrType::Array(..), .. }) || matches!(i, IrInst::GetPtr{..}) || matches!(i, IrInst::GetElemPtr{..})
         }));
-        if info.def_blocks.len() >= 2 && !has_arrays_or_calls {
+        if false && info.def_blocks.len() >= 2 {
             let has_dom = info.def_blocks.iter().any(|&d1|
                 info.def_blocks.iter().any(|&d2| d1 != d2 && dom[d1][d2])
             );
