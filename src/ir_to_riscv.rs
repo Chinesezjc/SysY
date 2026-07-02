@@ -454,14 +454,16 @@ fn emit_inst(e: &mut RvEmitter, inst: &IrInst, frame: &FrameInfo, program: &IrPr
             let callee = program.func_name(*func).strip_prefix('@').unwrap_or(program.func_name(*func)).to_string();
             let n = args.len();
 
-            // Flush all dirty virtual registers before call (caller-saved)
+            // Flush all tracked registers before call (caller-saved).
+            // Callee may clobber any register, so evict everything.
             if track {
-                let dirty: Vec<(usize, String)> = tracker.locals.iter()
-                    .filter(|(_, (_, d))| *d)
-                    .map(|(l, (r, _))| (*l, r.clone()))
+                let all: Vec<(usize, String)> = tracker.locals.iter()
+                    .map(|(l, (r, _d))| (*l, r.clone()))
                     .collect();
-                for (local, reg) in dirty {
-                    emit_sw(e, &reg, lo(local));
+                for (local, reg) in all {
+                    if tracker.is_dirty(local) {
+                        emit_sw(e, &reg, lo(local));
+                    }
                     tracker.evict(local);
                 }
             }
